@@ -3584,6 +3584,7 @@ class SmartAgent:
                             plan.progress_notes = plan.progress_notes[-10:]
 
                     guardrail_reason: Optional[str] = None
+                    guardrail_message: Optional[str] = None
                     if not progress_info.get('planned', False):
                         guardrail_reason = 'внеплановый вызов инструмента'
                     elif not result.success:
@@ -3591,7 +3592,6 @@ class SmartAgent:
 
                     if guardrail_reason and focus_reinforcements < max_focus_reinforcements:
                         guardrail_message = self._build_focus_guardrail(context, guardrail_reason)
-                        messages.append({"role": "system", "content": guardrail_message})
                         focus_reinforcements += 1
                         logger.warning(
                             "Активировано напоминание о фокусе (причина: %s, итого: %s)",
@@ -3654,6 +3654,9 @@ class SmartAgent:
                         "content": function_content
                     }
                     messages.append(function_response)
+
+                    if guardrail_message:
+                        messages.append({"role": "system", "content": guardrail_message})
 
                     # Проверяем на завершение задачи
                     if func_name == "finish_task" and result.success:
