@@ -16,10 +16,7 @@ import ast
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
-from urllib.parse import urlparse, urljoin, urlencode
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-from html import unescape
+from urllib.parse import urlparse
 import trafilatura
 from datetime import datetime, date
 from io import BytesIO
@@ -200,7 +197,7 @@ class AdvancedIntentAnalyzer:
     def analyze_with_llm(self, query: str) -> TaskContext:
         """Анализирует запрос с помощью LLM для глубокого понимания намерений."""
         
-        analysis_prompt = f"""Я - продвинутый аналитик задач. Мне нужно проанализировать запрос пользователя и понять его истинные намерения.
+        analysis_prompt = f"""Я - продвинутый аналитик задач. Мне нужно проанализировать запрос пользователя и понять его истинные намерения. Я не допускаю ленивых выводов и отмечаю потребность в инструментах, если она присутствует.
 
 ТЕКУЩАЯ ДАТА: {CURRENT_DATE_FORMATTED}
 
@@ -219,10 +216,11 @@ class AdvancedIntentAnalyzer:
    - Есть ли временные ограничения?
 
 3. НЕОБХОДИМЫЕ ИНСТРУМЕНТЫ:
-   - Нужен ли веб-поиск для получения свежей информации?
-   - Требуется ли интерактивная работа с браузером?
-   - Нужны ли вычисления или анализ данных?
-   - Следует ли экспортировать результат в Excel?
+   - Нужен ли веб-поиск для получения свежей информации? (если сомневаюсь, ставлю requires_search = true)
+   - Требуется ли интерактивная работа с браузером для динамических действий?
+   - Нужны ли вычисления, код или анализ данных?
+   - Следует ли экспортировать результат в Excel или подготовить файл?
+   - Какие артефакты (файлы, таблицы) ожидает пользователь?
 
 4. СЛОЖНОСТЬ И ОБЛАСТЬ:
    - Насколько сложна задача? (простая/средняя/сложная)
@@ -232,6 +230,7 @@ class AdvancedIntentAnalyzer:
 5. КРИТЕРИИ УСПЕХА:
    - Как я пойму, что задача решена правильно?
    - Какой формат ответа будет наиболее полезен?
+   - Какие проверки и подтверждения нужно выполнить перед финалом?
 
 Я отвечу в формате JSON:
 {{
@@ -408,7 +407,10 @@ class AdvancedTaskPlanner:
     def create_smart_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает умный план выполнения с использованием LLM."""
         
-        planning_prompt = f"""Я - опытный планировщик задач. Мне нужно создать оптимальный план выполнения для следующей задачи:
+        extra_success = context.meta_analysis.get('success_criteria', []) if context.meta_analysis else []
+        formatted_success = ", ".join(extra_success[:3]) if extra_success else "не указаны"
+
+        planning_prompt = f"""Я - опытный планировщик задач. Мне нужно создать оптимальный план выполнения для следующей задачи. План должен предусматривать реальные вызовы инструментов и избегать ленивого описания действий:
 
 КОНТЕКСТ ЗАДАЧИ:
 - Запрос: "{context.query}"
@@ -419,6 +421,8 @@ class AdvancedTaskPlanner:
 - Срочность: {context.urgency}
 - Временной контекст: {context.temporal_context}
 - Ключевые слова: {', '.join(context.keywords)}
+- Флаги потребностей: поиск={context.requires_search}, браузер={context.requires_browser}, код={context.requires_computation}, excel={getattr(context, 'requires_excel', False)}
+- Критерии успеха из анализа: {formatted_success}
 
 ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
 1. web_search - поиск в интернете
@@ -446,9 +450,15 @@ class AdvancedTaskPlanner:
    - Применять вычисления для анализа данных
    - Экспортировать результаты если требуется
 
-3. ОЦЕНКА РИСКОВ:
+3. ОЦЕНКА РИСКОВ И АРТЕФАКТОВ:
    - Что может пойти не так?
    - Какие альтернативы подготовить?
+   - Какие файлы, отчеты или заметки нужно создать и где их сохранить?
+   - Как убедиться, что перед финалом зафиксированы источники и проверки?
+
+4. ФИНАЛИЗАЦИЯ:
+   - Какие шаги необходимы перед вызовом finish_task?
+   - Как резюмировать результаты и сослаться на источники?
 
 Я отвечу в формате JSON:
 {{
@@ -727,216 +737,18 @@ class AdvancedTaskPlanner:
             # Улучшаем поисковый запрос
             if context.temporal_context == 'current':
                 adapted['query'] = f"{context.query} {CURRENT_DATE_STR}"
-            elif any(kw in context.keywords for kw in ['ставка', 'цб', 'банк']):
-                adapted['query'] = f"{context.query} ЦБ РФ сегодня"
             else:
                 adapted['query'] = context.query
-            
+
             adapted['keywords'] = context.keywords
-        
-        elif step['tool'] == 'browser_navigate':
-            # Если нужна актуальная информация, используем специальные сайты
-            if context.domain == 'finance' and any(kw in context.keywords for kw in ['ставка', 'цб']):
-                adapted['url'] = 'https://www.cbr.ru/'
 
         return adapted
-
-    def _needs_cbr_key_rate(self, context: TaskContext) -> bool:
-        query_lower = context.query.lower()
-        keywords = {kw.lower() for kw in context.keywords}
-
-        has_rate = any(indicator in query_lower for indicator in ['ключев', 'key rate', 'keyrate']) or any(
-            ('ставк' in kw or 'ключев' in kw) for kw in keywords
-        )
-
-        has_bank = any(indicator in query_lower for indicator in ['цб', 'банк россии', 'банка россии', 'банк рф', 'банка рф', 'cbr']) or any(
-            kw in {'цб', 'банк', 'cbr', 'россии'} for kw in keywords
-        )
-
-        return has_rate and has_bank
-
-    def _extract_explicit_date(self, text: str) -> Optional[datetime]:
-        if not text:
-            return None
-
-        numeric_match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})', text)
-        if numeric_match:
-            day, month, year = numeric_match.groups()
-            year_int = int(year)
-            if year_int < 100:
-                year_int += 2000
-            try:
-                return datetime(year_int, int(month), int(day))
-            except ValueError:
-                return None
-
-        text_lower = text.lower()
-        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', text_lower)
-        if month_match:
-            if 'кварт' in month_match.group(2):
-                return None
-
-            day = int(month_match.group(1))
-            month_token = month_match.group(2)
-            year_int = int(month_match.group(3))
-
-            month_map = {
-                'янв': 1,
-                'фев': 2,
-                'мар': 3,
-                'апр': 4,
-                'май': 5,
-                'мая': 5,
-                'июн': 6,
-                'июл': 7,
-                'авг': 8,
-                'сен': 9,
-                'окт': 10,
-                'ноя': 11,
-                'дек': 12
-            }
-
-            for prefix, month_value in month_map.items():
-                if month_token.startswith(prefix):
-                    try:
-                        return datetime(year_int, month_value, day)
-                    except ValueError:
-                        return None
-
-        return None
-
-    def _extract_quarter_period(self, text: str) -> Optional[Tuple[datetime, datetime]]:
-        text_lower = text.lower()
-
-        quarter = None
-        quarter_match = re.search(r'([1-4])\s*квартал', text_lower)
-        if quarter_match:
-            quarter = int(quarter_match.group(1))
-        else:
-            roman_match = re.search(r'\b(i{1,3}|iv)\s*квартал', text_lower)
-            if roman_match:
-                roman_map = {'i': 1, 'ii': 2, 'iii': 3, 'iv': 4}
-                quarter = roman_map.get(roman_match.group(1))
-        if quarter is None and 'квартал' in text_lower:
-            word_map = {'перв': 1, 'втор': 2, 'трет': 3, 'треть': 3, 'четв': 4}
-            for prefix, value in word_map.items():
-                if prefix in text_lower:
-                    quarter = value
-                    break
-
-        year_match = re.search(r'(20\d{2})', text_lower)
-        if quarter and year_match:
-            year = int(year_match.group(1))
-            start_month_map = {1: 1, 2: 4, 3: 7, 4: 10}
-            end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-            start_dt = datetime(year, start_month_map[quarter], 1)
-            end_month, end_day = end_map[quarter]
-            end_dt = datetime(year, end_month, end_day)
-            return start_dt, end_dt
-
-        return None
-
-    def _prepare_cbr_parameters(self, context: TaskContext) -> Dict[str, Any]:
-        parameters: Dict[str, Any] = {}
-        query_text = context.query
-        query_lower = query_text.lower()
-
-        quarter_period = self._extract_quarter_period(query_text)
-        explicit_date = self._extract_explicit_date(query_text)
-
-        start_dt: Optional[datetime] = None
-        end_dt: Optional[datetime] = None
-        target_dt: Optional[datetime] = None
-
-        if quarter_period:
-            start_dt, end_dt = quarter_period
-            target_dt = end_dt
-
-        if explicit_date:
-            target_dt = explicit_date
-
-        if target_dt and start_dt and target_dt < start_dt:
-            start_dt = target_dt
-        if target_dt and end_dt and target_dt > end_dt:
-            end_dt = target_dt
-
-        if target_dt and not start_dt and not end_dt:
-            start_dt = target_dt
-            end_dt = target_dt
-
-        if start_dt:
-            parameters['start_date'] = start_dt.strftime('%d.%m.%Y')
-        if end_dt:
-            parameters['end_date'] = end_dt.strftime('%d.%m.%Y')
-        if target_dt:
-            parameters['target_date'] = target_dt.strftime('%d.%m.%Y')
-
-        parameters['return_all'] = context.requires_excel or any(
-            token in query_lower for token in ['excel', 'эксель', 'таблиц', 'сохран']
-        )
-
-        return parameters
-
-    def _build_cbr_parse_parameters(self, cbr_params: Dict[str, Any]) -> Dict[str, Any]:
-        start = cbr_params.get('start_date')
-        end = cbr_params.get('end_date')
-
-        query_params = {'UniDbQuery.Posted': 'True'}
-        if start:
-            query_params['UniDbQuery.From'] = start
-        if end:
-            query_params['UniDbQuery.To'] = end
-
-        if not start and not end:
-            return {
-                'url': 'https://www.cbr.ru/hd_base/KeyRate/',
-                'extract_focus': 'ключевая ставка; таблица; Банк России'
-            }
-
-        return {
-            'url': f"https://www.cbr.ru/hd_base/KeyRate/?{urlencode(query_params)}",
-            'extract_focus': 'ключевая ставка; таблица; Банк России'
-        }
 
     def _postprocess_steps(self, steps: List[Dict[str, Any]], context: TaskContext) -> List[Dict[str, Any]]:
         if not steps:
             return steps
 
         processed_steps = [step.copy() for step in steps]
-
-        if self._needs_cbr_key_rate(context):
-            cbr_params = self._prepare_cbr_parameters(context)
-
-            has_cbr_step = False
-            for step in processed_steps:
-                if step.get('tool') == 'cbr_key_rate':
-                    step.setdefault('description', 'Получение ключевой ставки Банка России из официального источника')
-                    step.setdefault('priority', 1)
-                    for key, value in cbr_params.items():
-                        if value is not None:
-                            step[key] = value
-                    has_cbr_step = True
-
-            if not has_cbr_step:
-                new_step = {
-                    'tool': 'cbr_key_rate',
-                    'priority': 1,
-                    'description': 'Получение ключевой ставки Банка России из официального источника'
-                }
-                for key, value in cbr_params.items():
-                    if value is not None:
-                        new_step[key] = value
-                processed_steps.insert(0, new_step)
-
-            processed_steps = [step for step in processed_steps if step.get('tool') != 'web_search']
-
-            parse_updates = self._build_cbr_parse_parameters(cbr_params)
-            for step in processed_steps:
-                if step.get('tool') == 'web_parse':
-                    step.setdefault('description', 'Извлечение таблицы ключевой ставки с cbr.ru')
-                    for key, value in parse_updates.items():
-                        if value is not None:
-                            step[key] = value
 
         return processed_steps
 
@@ -1099,7 +911,6 @@ class AdvancedTaskPlanner:
             'wait_dynamic_content': 'Дождаться появления динамического контента',
             'code_execute': 'Запустить Python код для анализа данных',
             'excel_export': 'Сформировать Excel-файл с результатами исследования',
-            'cbr_key_rate': 'Получить официальные данные по ключевой ставке Банка России',
             'finish_task': 'Сформулировать финальный ответ пользователю'
         }
         return descriptions.get(tool_name, f"Выполнить действие {tool_name}")
@@ -1114,7 +925,6 @@ class AdvancedTaskPlanner:
             'wait_dynamic_content': 'Дождались загрузки динамического контента',
             'code_execute': 'Проведены вычисления и подготовлены результаты анализа',
             'excel_export': 'Создан Excel-файл с итоговыми данными и сохранен в рабочей директории',
-            'cbr_key_rate': 'Получено актуальное значение ключевой ставки из официального источника',
             'finish_task': 'Подготовлен финальный ответ с выводами и ссылками на источники',
             'analyze_results': 'Синтезированы выводы на основе собранных данных'
         }
@@ -1123,7 +933,7 @@ class AdvancedTaskPlanner:
     def _determine_phase(self, tool_name: str) -> str:
         gather_tools = {
             'web_search', 'web_parse', 'browser_navigate', 'browser_extract',
-            'browser_click', 'wait_dynamic_content', 'cbr_key_rate', 'read_file', 'ls'
+            'browser_click', 'wait_dynamic_content', 'read_file', 'ls'
         }
         analysis_tools = {'code_execute', 'analyze_results', 'edit_file'}
         delivery_tools = {'excel_export', 'finish_task', 'write_file'}
@@ -1149,9 +959,6 @@ class AdvancedTaskPlanner:
 
         if any(step.get('tool') in {'web_parse', 'browser_extract', 'browser_navigate'} for step in steps):
             criteria.append('Извлечь ключевые данные из найденных источников и зафиксировать их в заметках')
-
-        if 'cbr_key_rate' in tool_set:
-            criteria.append('Получить значение ключевой ставки Банка России непосредственно с cbr.ru')
 
         if 'code_execute' in tool_set:
             criteria.append('Выполнить вычисления в Python и включить результаты в итоговый ответ')
@@ -2322,333 +2129,6 @@ class BrowserTool:
             )
 
 
-class CBRDataTool:
-    """Инструмент для получения ключевой ставки Банка России с официального сайта."""
-
-    MONTH_PREFIXES = {
-        'январ': 1,
-        'янв': 1,
-        'феврал': 2,
-        'фев': 2,
-        'март': 3,
-        'мар': 3,
-        'апрел': 4,
-        'апр': 4,
-        'мая': 5,
-        'май': 5,
-        'июн': 6,
-        'июл': 7,
-        'август': 8,
-        'авг': 8,
-        'сентябр': 9,
-        'сен': 9,
-        'октябр': 10,
-        'окт': 10,
-        'ноябр': 11,
-        'ноя': 11,
-        'декабр': 12,
-        'дек': 12
-    }
-
-    def __init__(self):
-        self.available = True
-        self.base_url = "https://www.cbr.ru/hd_base/KeyRate/"
-        self.logger = logging.getLogger("CBRDataTool")
-
-    def fetch_key_rate(
-        self,
-        target_date: Optional[Union[str, date, datetime]] = None,
-        start_date: Optional[Union[str, date, datetime]] = None,
-        end_date: Optional[Union[str, date, datetime]] = None,
-        return_all: Union[bool, str, int] = False
-    ) -> ToolResult:
-        """Возвращает значения ключевой ставки за указанный период."""
-
-        start_time = time.time()
-
-        if not self.available:
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=False,
-                data=None,
-                error="Инструмент получения данных ЦБ недоступен",
-                execution_time=time.time() - start_time
-            )
-
-        try:
-            normalized_start = self._parse_date_input(start_date)
-            normalized_end = self._parse_date_input(end_date)
-            normalized_target = self._parse_date_input(target_date)
-            return_all_flag = self._to_bool(return_all)
-
-            if normalized_target and not (normalized_start or normalized_end):
-                normalized_start = normalized_target
-                normalized_end = normalized_target
-
-            if normalized_start and normalized_end and normalized_start > normalized_end:
-                normalized_start, normalized_end = normalized_end, normalized_start
-
-            if normalized_target:
-                if normalized_start and normalized_target < normalized_start:
-                    normalized_start = normalized_target
-                if normalized_end and normalized_target > normalized_end:
-                    normalized_end = normalized_target
-
-            html, request_url = self._download_dataset(normalized_start, normalized_end)
-            execution_time = time.time() - start_time
-
-            if html is None:
-                return ToolResult(
-                    tool_name="cbr_key_rate",
-                    success=False,
-                    data=None,
-                    error="Не удалось загрузить данные с сайта Банка России",
-                    metadata={'request_url': request_url},
-                    execution_time=execution_time
-                )
-
-            records = self._extract_records(html)
-
-            if not records:
-                return ToolResult(
-                    tool_name="cbr_key_rate",
-                    success=False,
-                    data=None,
-                    error="На странице Банка России не найдены данные о ключевой ставке",
-                    metadata={'request_url': request_url},
-                    execution_time=execution_time
-                )
-
-            period_start_iso = normalized_start.strftime('%Y-%m-%d') if normalized_start else (records[-1]['date'] if records else None)
-            period_end_iso = normalized_end.strftime('%Y-%m-%d') if normalized_end else (records[0]['date'] if records else None)
-
-            filtered_records = records
-            if normalized_start or normalized_end:
-                filtered_records = [
-                    rec for rec in records
-                    if (not normalized_start or datetime.strptime(rec['date'], '%Y-%m-%d') >= normalized_start)
-                    and (not normalized_end or datetime.strptime(rec['date'], '%Y-%m-%d') <= normalized_end)
-                ]
-                if not filtered_records:
-                    filtered_records = records
-
-            match_record = None
-            if normalized_target:
-                match_record = self._select_record_for_date(records, normalized_target)
-            elif filtered_records:
-                match_record = filtered_records[0]
-
-            result_records = filtered_records if return_all_flag else ([match_record] if match_record else filtered_records[:1])
-
-            if not result_records:
-                result_records = records[:1]
-                match_record = result_records[0] if result_records else None
-
-            note = None
-            if normalized_target and match_record:
-                match_date = datetime.strptime(match_record['date'], '%Y-%m-%d')
-                if match_date != normalized_target:
-                    note = "Запрошенная дата отсутствует, возвращено ближайшее доступное значение"
-
-            data_payload = {
-                'records': result_records,
-                'match': match_record,
-                'target_date': normalized_target.strftime('%Y-%m-%d') if normalized_target else None,
-                'period': {
-                    'start': period_start_iso,
-                    'end': period_end_iso
-                },
-                'source_url': request_url,
-                'official_source': self.base_url,
-                'retrieved_at': CURRENT_DATE.isoformat()
-            }
-
-            if note:
-                data_payload['note'] = note
-
-            metadata = {
-                'records_returned': len(result_records),
-                'records_available': len(records),
-                'request_url': request_url,
-                'start_date': period_start_iso,
-                'end_date': period_end_iso,
-                'target_date': data_payload['target_date'],
-                'source': 'Банк России (cbr.ru)'
-            }
-
-            confidence = 0.95 if match_record else 0.8
-
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=True,
-                data=data_payload,
-                metadata=metadata,
-                execution_time=execution_time,
-                confidence=confidence
-            )
-
-        except Exception as error:
-            execution_time = time.time() - start_time
-            self.logger.error("Ошибка получения ключевой ставки: %s", error)
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=False,
-                data=None,
-                error=str(error),
-                execution_time=execution_time
-            )
-
-    def _to_bool(self, value: Union[bool, str, int, float]) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if isinstance(value, str):
-            return value.strip().lower() in {'1', 'true', 'yes', 'y', 'да', 'истина'}
-        return bool(value)
-
-    def _parse_date_input(self, value: Optional[Union[str, date, datetime]]) -> Optional[datetime]:
-        if value is None:
-            return None
-
-        if isinstance(value, datetime):
-            return value.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        if isinstance(value, date):
-            return datetime.combine(value, datetime.min.time())
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        cleaned = text.lower().replace('года', '').replace('г.', '').replace('год', '').strip()
-
-        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', cleaned)
-        if month_match:
-            day = int(month_match.group(1))
-            month_text = month_match.group(2)
-            year = int(month_match.group(3))
-            month = self._month_from_text(month_text)
-            if month:
-                try:
-                    return datetime(year, month, day)
-                except ValueError:
-                    return None
-
-        normalized = cleaned.replace('/', '.').replace('-', '.').replace('\u00a0', '')
-
-        for fmt in ("%d.%m.%Y", "%Y.%m.%d", "%d.%m.%y"):
-            try:
-                parsed = datetime.strptime(normalized, fmt)
-                if fmt == "%d.%m.%y" and parsed.year < 2000:
-                    parsed = parsed.replace(year=parsed.year + 2000)
-                return parsed
-            except ValueError:
-                continue
-
-        return None
-
-    def _month_from_text(self, text: str) -> Optional[int]:
-        for prefix, month in self.MONTH_PREFIXES.items():
-            if text.startswith(prefix):
-                return month
-        return None
-
-    def _download_dataset(self, start: Optional[datetime], end: Optional[datetime]) -> Tuple[Optional[str], str]:
-        params = {}
-        if start or end:
-            params['UniDbQuery.Posted'] = 'True'
-            if start:
-                params['UniDbQuery.From'] = start.strftime('%d.%m.%Y')
-            if end:
-                params['UniDbQuery.To'] = end.strftime('%d.%m.%Y')
-
-        request_url = self.base_url if not params else f"{self.base_url}?{urlencode(params)}"
-
-        try:
-            request = Request(
-                request_url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
-                }
-            )
-            with urlopen(request, timeout=30) as response:
-                html = response.read().decode('utf-8', errors='ignore')
-            return html, request_url
-        except (HTTPError, URLError) as error:
-            self.logger.error("Ошибка загрузки страницы Банка России: %s", error)
-            return None, request_url
-        except Exception as error:
-            self.logger.error("Неожиданная ошибка загрузки данных ЦБ: %s", error)
-            return None, request_url
-
-    def _extract_records(self, html: str) -> List[Dict[str, Any]]:
-        if not html:
-            return []
-
-        table_pattern = re.compile(r'<table[^>]*>(.*?)</table>', re.IGNORECASE | re.DOTALL)
-        row_pattern = re.compile(r'<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*</tr>', re.IGNORECASE | re.DOTALL)
-
-        records: List[Dict[str, Any]] = []
-        seen_dates: Set[str] = set()
-
-        for table_html in table_pattern.findall(html):
-            for date_raw, rate_raw in row_pattern.findall(table_html):
-                date_text = unescape(date_raw).strip()
-                rate_text = unescape(rate_raw).strip()
-
-                if not re.match(r'\d{2}\.\d{2}\.\d{4}', date_text):
-                    continue
-
-                try:
-                    parsed_date = datetime.strptime(date_text, '%d.%m.%Y')
-                except ValueError:
-                    continue
-
-                iso_date = parsed_date.strftime('%Y-%m-%d')
-                if iso_date in seen_dates:
-                    continue
-
-                try:
-                    rate_value = float(rate_text.replace(',', '.').replace(' ', ''))
-                except ValueError:
-                    continue
-
-                records.append({
-                    'date': iso_date,
-                    'display_date': date_text,
-                    'rate_percent': rate_value,
-                    'rate_display': rate_text,
-                    'source': self.base_url
-                })
-                seen_dates.add(iso_date)
-
-        records.sort(key=lambda item: item['date'], reverse=True)
-        return records
-
-    def _select_record_for_date(self, records: List[Dict[str, Any]], target: datetime) -> Optional[Dict[str, Any]]:
-        if not records:
-            return None
-
-        target_date = target.date()
-
-        for record in records:
-            record_date = datetime.strptime(record['date'], '%Y-%m-%d').date()
-            if record_date == target_date:
-                return record
-
-        earlier = [
-            record for record in records
-            if datetime.strptime(record['date'], '%Y-%m-%d').date() <= target_date
-        ]
-
-        if earlier:
-            return earlier[0]
-
-        return records[-1] if records else None
-
-
 class ExcelExporter:
     """Класс для экспорта данных в Excel."""
 
@@ -3446,7 +2926,6 @@ class SmartAgent:
         self.web_search = WebSearchTool()
         self.web_parser = WebParsingTool()
         self.browser = BrowserTool()
-        self.cbr_data_tool = CBRDataTool()
         self.code_executor = CodeExecutor()
         self.excel_exporter = ExcelExporter()
         self.file_system = FileSystemTools()
@@ -3465,17 +2944,21 @@ class SmartAgent:
         if self.web_search.available:
             functions.append({
                 "name": "web_search",
-                "description": "Выполняет поиск в интернете по запросу",
+                "description": (
+                    "Выполняет целевой веб-поиск. Используй, когда нужны свежие факты, официальные источники "
+                    "или дополнительные ссылки. Формируй запрос с учетом контекста задачи (даты, регион, отрасль) "
+                    "и не ограничивайся одним поиском, если требуется несколько перспектив."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Поисковый запрос"
+                            "description": "Точный поисковый запрос с ключевым контекстом"
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Максимальное количество результатов",
+                            "description": "Сколько результатов вернуть (увеличивай для расширенного обзора)",
                             "default": 5
                         }
                     },
@@ -3486,17 +2969,21 @@ class SmartAgent:
         if self.web_parser.available:
             functions.append({
                 "name": "web_parse",
-                "description": "Извлекает содержимое веб-страницы",
+                "description": (
+                    "Извлекает и структурирует HTML-страницу. Применяй после получения ссылки, когда нужен "
+                    "конкретный блок информации со статического сайта. Указывай extract_focus, чтобы выделить "
+                    "релевантные фрагменты и сократить шум."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "URL страницы для парсинга"
+                            "description": "Полный URL страницы для извлечения"
                         },
                         "extract_focus": {
                             "type": "string",
-                            "description": "Фокус для извлечения (ключевые слова)"
+                            "description": "Ключевые слова или темы, которые нужно подчеркнуть"
                         }
                     },
                     "required": ["url"]
@@ -3507,13 +2994,16 @@ class SmartAgent:
             functions.extend([
                 {
                     "name": "browser_navigate",
-                    "description": "Переходит на веб-страницу в браузере с поддержкой динамического контента",
+                    "description": (
+                        "Открывает страницу в полноценном браузере. Используй для динамических сайтов, "
+                        "интерактивных форм, личных кабинетов и любых сценариев, где необходим JavaScript."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "url": {
                                 "type": "string",
-                                "description": "URL для перехода"
+                                "description": "Точный URL, который нужно открыть"
                             }
                         },
                         "required": ["url"]
@@ -3521,17 +3011,21 @@ class SmartAgent:
                 },
                 {
                     "name": "browser_extract",
-                    "description": "Извлекает контент со страницы в браузере с ожиданием динамического контента",
+                    "description": (
+                        "Извлекает контент из страницы, открытой браузером. Комбинируй с browser_navigate и "
+                        "wait_dynamic_content, чтобы дождаться появления нужных блоков. Указывай selector для "
+                        "точного извлечения."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "selector": {
                                 "type": "string",
-                                "description": "CSS селектор для извлечения (опционально)"
+                                "description": "CSS-селектор или XPath нужного элемента (опционально)"
                             },
                             "wait_for_element": {
                                 "type": "boolean",
-                                "description": "Ждать появления элемента",
+                                "description": "Ждать ли появления элемента перед извлечением",
                                 "default": True
                             }
                         }
@@ -3539,13 +3033,16 @@ class SmartAgent:
                 },
                 {
                     "name": "browser_click",
-                    "description": "Кликает по элементу на странице",
+                    "description": (
+                        "Эмулирует клик по элементу страницы. Применяй для раскрытия скрытого содержимого, "
+                        "нажатия кнопок, скачивания файлов или перехода по вкладкам."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "selector": {
                                 "type": "string",
-                                "description": "Селектор элемента для клика"
+                                "description": "CSS-селектор элемента, по которому нужно кликнуть"
                             }
                         },
                         "required": ["selector"]
@@ -3553,13 +3050,16 @@ class SmartAgent:
                 },
                 {
                     "name": "wait_dynamic_content",
-                    "description": "Ждет загрузки динамического контента на странице",
+                    "description": (
+                        "Ждет появления динамического контента. Вызывай после навигации или кликов, чтобы страница "
+                        "успела загрузить данные перед извлечением."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "timeout": {
                                 "type": "integer",
-                                "description": "Таймаут ожидания в миллисекундах",
+                                "description": "Максимальное время ожидания в миллисекундах",
                                 "default": 10000
                             }
                         }
@@ -3567,43 +3067,19 @@ class SmartAgent:
                 }
             ])
 
-        if getattr(self, 'cbr_data_tool', None) and self.cbr_data_tool.available:
-            functions.append({
-                "name": "cbr_key_rate",
-                "description": "Получает ключевую ставку Банка России напрямую с официального сайта cbr.ru",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target_date": {
-                            "type": "string",
-                            "description": "Дата, для которой нужно найти ставку (форматы ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "start_date": {
-                            "type": "string",
-                            "description": "Начало периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "end_date": {
-                            "type": "string",
-                            "description": "Конец периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "return_all": {
-                            "type": "boolean",
-                            "description": "Возвращать весь период вместо одного значения",
-                            "default": False
-                        }
-                    }
-                }
-            })
-
         functions.append({
             "name": "code_execute",
-            "description": "Выполняет Python код для вычислений, анализа и экспорта в Excel",
+            "description": (
+                "Выполняет Python-код в изолированной среде. Подходит для расчётов, анализа данных, генерации "
+                "таблиц и подготовки вспомогательных структур. Доступны функции save_to_excel() и create_excel_report() "
+                "для быстрой выгрузки результатов."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Python код для выполнения. Доступны функции save_to_excel() и create_excel_report()"
+                        "description": "Чистый Python-код без внешних зависимостей"
                     }
                 },
                 "required": ["code"]
@@ -3613,21 +3089,24 @@ class SmartAgent:
         if self.excel_exporter.available:
             functions.append({
                 "name": "excel_export",
-                "description": "Экспортирует данные в Excel файл",
+                "description": (
+                    "Создаёт Excel-файл из подготовленных данных. Используй для структурированных отчётов, "
+                    "таблиц и аналитических выкладок, которые нужно передать пользователю."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "data": {
                             "type": "string",
-                            "description": "Данные для экспорта в JSON формате"
+                            "description": "Данные в JSON-формате (список словарей или словарь списков)"
                         },
                         "filename": {
                             "type": "string",
-                            "description": "Имя файла (опционально)"
+                            "description": "Имя файла без пути (опционально)"
                         },
                         "sheet_name": {
                             "type": "string",
-                            "description": "Название листа",
+                            "description": "Название листа в Excel",
                             "default": "Данные"
                         }
                     },
@@ -3639,22 +3118,25 @@ class SmartAgent:
         functions.extend([
             {
                 "name": "ls",
-                "description": "Показывает содержимое рабочей директории агента",
+                "description": (
+                    "Показывает содержимое рабочей директории. Используй перед записью файлов, чтобы понять "
+                    "структуру и избежать случайной перезаписи артефактов."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Путь относительно рабочей директории (опционально)"
+                            "description": "Относительный путь (оставь пустым для корневого каталога)"
                         },
                         "recursive": {
                             "type": "boolean",
-                            "description": "Показывать содержимое рекурсивно",
+                            "description": "Показывать ли содержимое поддиректорий",
                             "default": False
                         },
                         "include_hidden": {
                             "type": "boolean",
-                            "description": "Включать скрытые файлы",
+                            "description": "Включать ли скрытые файлы",
                             "default": False
                         }
                     }
@@ -3662,7 +3144,10 @@ class SmartAgent:
             },
             {
                 "name": "read_file",
-                "description": "Читает файл с номерами строк из рабочей директории",
+                "description": (
+                    "Читает файл с указанием номеров строк. Используй для изучения исходных данных, проверки "
+                    "изменений и цитирования фрагментов."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3672,12 +3157,12 @@ class SmartAgent:
                         },
                         "offset": {
                             "type": "integer",
-                            "description": "С какой строки начать чтение",
+                            "description": "С какой строки начать чтение (0 — с начала)",
                             "default": 0
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Сколько строк прочитать",
+                            "description": "Сколько строк вывести (по умолчанию выводится весь файл)",
                             "default": 2000
                         }
                     },
@@ -3686,7 +3171,10 @@ class SmartAgent:
             },
             {
                 "name": "write_file",
-                "description": "Создает или перезаписывает файл в рабочей директории",
+                "description": (
+                    "Создаёт новый файл или перезаписывает существующий. Перед вызовом убедись, что контент "
+                    "подготовлен и проверен, и соблюдай порядок ls → read_file → write_file."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3696,11 +3184,11 @@ class SmartAgent:
                         },
                         "content": {
                             "type": "string",
-                            "description": "Содержимое файла"
+                            "description": "Новый контент файла"
                         },
                         "overwrite": {
                             "type": "boolean",
-                            "description": "Перезаписать файл, если он существует",
+                            "description": "Перезаписывать ли файл, если он уже существует",
                             "default": False
                         }
                     },
@@ -3709,7 +3197,10 @@ class SmartAgent:
             },
             {
                 "name": "edit_file",
-                "description": "Заменяет текст в существующем файле",
+                "description": (
+                    "Точечно заменяет текст в существующем файле. Предпочитай этот инструмент вместо полной "
+                    "перезаписи, когда нужно внести правку в конкретный фрагмент."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3719,15 +3210,15 @@ class SmartAgent:
                         },
                         "old_string": {
                             "type": "string",
-                            "description": "Исходный текст для замены"
+                            "description": "Какой текст нужно заменить"
                         },
                         "new_string": {
                             "type": "string",
-                            "description": "Новый текст"
+                            "description": "Новый текст, который следует подставить"
                         },
                         "replace_all": {
                             "type": "boolean",
-                            "description": "Заменить все вхождения",
+                            "description": "Заменить ли все вхождения (по умолчанию только первое)",
                             "default": False
                         }
                     },
@@ -3738,13 +3229,17 @@ class SmartAgent:
 
         functions.append({
             "name": "finish_task",
-            "description": "Завершает выполнение задачи с финальным ответом",
+            "description": (
+                "Формирует финальный ответ пользователю. Вызывай только после того, как все необходимые инструменты "
+                "использованы, а доказательства собраны. Ответ должен содержать выводы, ссылки на источники и "
+                "отражать выполненные шаги."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "answer": {
                         "type": "string",
-                        "description": "Финальный ответ пользователю"
+                        "description": "Полный финальный ответ для пользователя"
                     }
                 },
                 "required": ["answer"]
@@ -3783,14 +3278,6 @@ class SmartAgent:
             elif function_name == "wait_dynamic_content":
                 return self.browser.wait_for_dynamic_content(
                     timeout=arguments.get("timeout", 10000)
-                )
-
-            elif function_name == "cbr_key_rate":
-                return self.cbr_data_tool.fetch_key_rate(
-                    target_date=arguments.get("target_date"),
-                    start_date=arguments.get("start_date"),
-                    end_date=arguments.get("end_date"),
-                    return_all=arguments.get("return_all", False)
                 )
 
             elif function_name == "code_execute":
@@ -4110,19 +3597,17 @@ class SmartAgent:
         excel_info = ""
         if EXCEL_AVAILABLE:
             excel_info = """
-- Я могу экспортировать данные в Excel используя excel_export или code_execute с save_to_excel()
-- У меня есть функция save_to_excel(data, filename, sheet_name) в code_execute
-- Я могу создать форматированный отчет через create_excel_report(title, data_dict, filename)"""
+- Для табличных результатов использую excel_export или функции save_to_excel()/create_excel_report() через code_execute
+- Всегда указываю имя созданного файла и описываю его содержимое для пользователя"""
 
         tools_status = f"""
 МОИ ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
-🔍 Веб-поиск: {'✅ Работает' if self.web_search.available else '❌ Недоступен'}
-📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}
-🌐 Браузер: {'✅ Работает' if self.browser.available else '❌ Недоступен'}
-🏦 Официальные данные ЦБ РФ: {'✅ Работает' if self.cbr_data_tool.available else '❌ Недоступен'} (функция cbr_key_rate)
-💻 Выполнение кода: ✅ Работает
-📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}
-🗂️ Файловая память: ✅ Работает (каталог: {self.file_system.base_dir})"""
+🔍 Веб-поиск: {'✅' if self.web_search.available else '❌'} — собираю новые источники и сравниваю несколько результатов
+📄 Статический парсинг: {'✅' if self.web_parser.available else '❌'} — извлекаю ключевые блоки текста со страниц
+🌐 Динамический браузер: {'✅' if self.browser.available else '❌'} — работаю с JS-сайтами, кликаю элементы и жду загрузку
+💻 Код и аналитика: ✅ — запускаю code_execute для вычислений, преобразования данных и генерации артефактов
+📊 Excel экспорт: {'✅' if EXCEL_AVAILABLE else '❌'} — формирую отчеты, когда нужен файл для пользователя
+🗂️ Файловая память: ✅ — веду заметки в {self.file_system.base_dir}, соблюдая порядок ls → read_file → write_file"""
 
         plan_reasoning = plan.reasoning if plan.reasoning else "План создан на основе базовых шаблонов"
 
@@ -4135,6 +3620,30 @@ class SmartAgent:
         # Исправляем строку с форматированием
         plan_steps_formatted = '\n'.join([f'{i}. {step.get("description", step["tool"])} (приоритет: {step.get("priority", "не указан")})' for i, step in enumerate(plan.steps, 1)])
         
+        requirement_lines = []
+        if context.requires_search:
+            requirement_lines.append("• Обязательно выполнить web_search для сбора свежих источников")
+        if context.requires_browser:
+            requirement_lines.append("• Использовать браузерные инструменты для интерактивных действий")
+        if context.requires_computation:
+            requirement_lines.append("• Провести вычисления или анализ данных через code_execute")
+        if getattr(context, 'requires_excel', False):
+            requirement_lines.append("• Подготовить табличный результат и сохранить его для пользователя")
+
+        requirements_section = ""
+        if requirement_lines:
+            requirements_section = "МОИ ОБЯЗАТЕЛЬНЫЕ ДЕЙСТВИЯ ПО ЗАДАЧЕ:\n" + "\n".join(requirement_lines)
+
+        meta_success = context.meta_analysis.get('success_criteria') if context.meta_analysis else None
+        meta_section = ""
+        if meta_success:
+            trimmed = meta_success[:3] if isinstance(meta_success, list) else [str(meta_success)]
+            meta_section = "ОСОБЫЕ КРИТЕРИИ УСПЕХА ОТ АНАЛИЗА:\n- " + "\n- ".join(trimmed)
+
+        reasoning_hint = ""
+        if context.meta_analysis.get('reasoning') if context.meta_analysis else None:
+            reasoning_hint = "АНАЛИЗ НАМЕРЕНИЙ:\n" + context.meta_analysis['reasoning']
+
         return f"""Я - продвинутый интеллектуальный агент X-Master v77 Enhanced. Моя роль - эффективно решать задачи пользователей, используя доступные инструменты и глубокий анализ.
 
 МОЯ ТЕКУЩАЯ СИТУАЦИЯ:
@@ -4149,6 +3658,10 @@ class SmartAgent:
 
 {tools_status}
 
+{requirements_section if requirements_section else ''}
+{meta_section if meta_section else ''}
+{reasoning_hint if reasoning_hint else ''}
+
 {file_system_guidelines}
 
 МОЙ ПЛАН ДЕЙСТВИЙ:
@@ -4160,16 +3673,16 @@ class SmartAgent:
 Критерии успеха: {', '.join(plan.success_criteria) if plan.success_criteria else 'Полный и точный ответ пользователю'}
 
 МОИ ПРИНЦИПЫ РАБОТЫ:
-1. Я всегда начинаю с глубокого анализа поставленной задачи
-2. Я использую инструменты последовательно и обдуманно
-3. Я проверяю результаты каждого шага перед переходом к следующему
-4. Для динамических сайтов я обязательно жду загрузки контента
-5. Я синтезирую информацию из разных источников для полного ответа
-6. Я учитываю текущую дату при поиске актуальной информации
-7. Для ключевой ставки Банка России я обязательно вызываю cbr_key_rate, получаю данные с https://www.cbr.ru/hd_base/KeyRate/ и не подставляю значения из сторонних источников{excel_info}
-8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
-9. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
-10. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
+1. Я начинаю с глубокого анализа и сверяю план с намерениями пользователя
+2. Я использую инструменты последовательно и тщательно фиксирую результаты каждого шага
+3. Для динамических сайтов я жду полной загрузки контента и подтверждаю, что данные получены
+4. Я синтезирую информацию из нескольких источников и объясняю, почему им можно доверять
+5. Я учитываю текущую дату при поиске актуальной информации и отмечаю время получения данных
+6. Я не допускаю ленивой оптимизации: не описываю шаги без реальных вызовов инструментов и не завершаю работу без фактического выполнения плана
+7. Если требуется табличный или файловый результат, я создаю его через code_execute/excel_export и сообщаю путь к артефакту
+8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом и ссылками
+9. Я отслеживаю прогресс длинных цепочек инструментов, адаптирую план и фиксирую заметки о ходе выполнения
+10. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения{('\n' + excel_info) if excel_info else ''}
 
 МОИ МЕТАКОГНИТИВНЫЕ СПОСОБНОСТИ:
 - Я анализирую свои действия и корректирую план при необходимости
@@ -4572,7 +4085,7 @@ def main():
         query = st.text_area(
             "Введите ваш запрос:",
             height=120,
-            placeholder="Примеры запросов:\n• Найди последние новости об искусственном интеллекте\n• Какая ключевая ставка ЦБ РФ сегодня? Создай отчет в Excel\n• Что произошло на этой неделе в мире технологий?\n• Проанализируй текущую ситуацию на рынке криптовалют\n• Какие события запланированы на сегодня в России?\n• Сравни курсы валют и экспортируй данные",
+            placeholder="Примеры запросов:\n• Найди последние новости об искусственном интеллекте\n• Собери аналитику по ключевым технологическим событиям недели\n• Что произошло на этой неделе в мире технологий?\n• Проанализируй текущую ситуацию на рынке криптовалют\n• Какие события запланированы на сегодня в России?\n• Сравни курсы валют и экспортируй данные",
             help="Агент автоматически проанализирует ваши намерения и создаст оптимальный план решения"
         )
     
@@ -4580,7 +4093,7 @@ def main():
         st.markdown("**🎯 Примеры задач:**")
         example_queries = [
             "Последние новости ИИ",
-            "Ключевая ставка ЦБ в Excel",
+            "Отчет о технологических событиях недели",
             "События недели в России",
             "Анализ криптовалют",
             "Курсы валют сегодня",
