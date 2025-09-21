@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import difflib
 import time
 import base64
 import uuid
@@ -137,6 +138,9 @@ class TaskContext:
     user_goal: str = "information"  # information, action, analysis, export
     confidence_score: float = 0.8
     meta_analysis: Dict[str, Any] = field(default_factory=dict)
+    original_query: Optional[str] = None
+    rewrite_strategy: str = "no_rewrite"
+    rewrite_features: Dict[str, Any] = field(default_factory=dict)
     
 
 @dataclass
@@ -167,6 +171,571 @@ class ToolResult:
     confidence: float = 0.8
 
 
+@dataclass
+class QueryFeatures:
+    """Лингвистические признаки запроса для адаптивной переформулировки."""
+
+    anaphora: bool = False
+    subordination: bool = False
+    mismatch: bool = False
+    presupposition: bool = False
+    pragmatics: bool = False
+    rarity: bool = False
+    negation: bool = False
+    superlative: bool = False
+    polysemy: bool = False
+    answerability: bool = True
+    excessive: bool = False
+    subjectivity: bool = False
+    ambiguity: bool = False
+    grounding: bool = False
+    constraints: bool = False
+    entities: bool = False
+    specialization: bool = False
+    length: int = 0
+    clarity_score: float = 1.0
+    confidence: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразует признаки в словарь для логирования и метаданных."""
+        return asdict(self)
+
+    def flagged_features(self) -> List[str]:
+        """Возвращает список активных признаков."""
+        return [
+            key for key, value in self.to_dict().items()
+            if isinstance(value, bool) and value
+        ]
+
+
+class QueryFeatureExtractor:
+    """Извлекает лингвистические признаки запроса согласно спецификации."""
+
+    ANAPHORA_PRONOUNS = {
+        'он', 'она', 'они', 'оно', 'его', 'ее', 'их', 'это', 'этот',
+        'эта', 'эти', 'там', 'тут', 'такой', 'такое', 'подобное'
+    }
+    SUBORDINATE_MARKERS = {
+        'что', 'котор', 'если', 'когда', 'пока', 'поскольку', 'потому что',
+        'чтобы', 'как только', 'когда бы'
+    }
+    PRAGMATIC_MARKERS = {
+        'пожалуйста', 'не могли бы', 'будьте добры', 'нужно', 'важно',
+        'желательно', 'прошу', 'давай'
+    }
+    PRESUPPOSITION_MARKERS = {
+        'снова', 'еще', 'опять', 'как обычно', 'по-прежнему'
+    }
+    SUBJECTIVE_MARKERS = {
+        'лучший', 'худший', 'нравится', 'не нравится', 'кажется',
+        'интересный', 'увлекательный', 'ужасный', 'потрясающий'
+    }
+    CONSTRAINT_MARKERS = {
+        'только', 'исключительно', 'не более', 'не менее', 'ровно',
+        'строго', 'в течение', 'до ', 'после '
+    }
+    GROUNDING_MARKERS = {
+        'согласно', 'по данным', 'по информации', 'источник', 'подтвердите',
+        'с опорой', 'сошлитесь'
+    }
+    POLYSEMY_CANDIDATES = {
+        'банк', 'мышь', 'лук', 'ключ', 'мир', 'коса', 'ручка', 'класс',
+        'депозит', 'ставка', 'счет'
+    }
+    GENERIC_NOUNS = {
+        'вещь', 'тема', 'ситуация', 'проблема', 'вопрос', 'дело', 'информация'
+    }
+    QUESTION_WORDS = {
+        'кто', 'что', 'где', 'когда', 'почему', 'зачем', 'как', 'сколько'
+    }
+    DIRECTIVE_VERBS = {
+        'объясни', 'расскажи', 'покажи', 'поясни', 'составь', 'проанализируй',
+        'найди', 'подбери', 'создай', 'подскажи'
+    }
+    COMMON_WORDS = {
+        'что', 'как', 'когда', 'почему', 'где', 'кто', 'можно', 'нужно',
+        'сделай', 'прошу', 'расскажи', 'объясни', 'из', 'для', 'или',
+        'и', 'о', 'про', 'это', 'какой', 'какая', 'сколько', 'дай',
+        'на', 'в', 'с', 'по', 'а'
+    }
+    DOMAIN_TERMS = {
+        'rl', 'reinforcement', 'api', 'sdk', 'kpi', 'roi', 'ml', 'ai',
+        'devops', 'sql', 'saas', 'crm', 'erp', 'финтех', 'биоинформатика'
+    }
+
+    def extract(self, query: str) -> QueryFeatures:
+        """Определяет признаки исходного запроса."""
+        features = QueryFeatures()
+        normalized = query.strip()
+        lower_query = normalized.lower()
+        tokens = re.findall(r"[\wёЁ]+", lower_query)
+
+        features.length = len(tokens)
+        features.anaphora = any(token in self.ANAPHORA_PRONOUNS for token in tokens)
+        features.subordination = any(
+            re.search(rf",\s*{marker}", lower_query)
+            for marker in self.SUBORDINATE_MARKERS
+        )
+        features.pragmatics = any(marker in lower_query for marker in self.PRAGMATIC_MARKERS)
+        features.presupposition = any(marker in lower_query for marker in self.PRESUPPOSITION_MARKERS)
+        features.negation = ' не ' in f" {lower_query} " or 'нет' in tokens
+        features.superlative = any(word in lower_query for word in ['самый', 'наиболее', 'наименьший', 'крайне'])
+        features.polysemy = any(token in self.POLYSEMY_CANDIDATES for token in tokens)
+        features.subjectivity = any(marker in lower_query for marker in self.SUBJECTIVE_MARKERS)
+        features.grounding = any(marker in lower_query for marker in self.GROUNDING_MARKERS)
+        features.constraints = bool(re.search(r"\d", lower_query)) or any(
+            marker in lower_query for marker in self.CONSTRAINT_MARKERS
+        )
+        features.entities = bool(re.search(r"[A-ZА-ЯЁ]{2,}", query)) or bool(
+            re.search(r"\b[А-ЯЁA-Z][а-яёa-z]+", query)
+        )
+        features.specialization = any(token in self.DOMAIN_TERMS for token in tokens) or bool(
+            re.search(r"\b[A-Z]{2,}\b", query)
+        )
+
+        rare_tokens = [token for token in tokens if len(token) > 10 or token not in self.COMMON_WORDS]
+        features.rarity = bool(tokens) and len(rare_tokens) / max(len(tokens), 1) > 0.35
+
+        features.excessive = features.length > 28 or len(normalized) > 200
+        features.answerability = (
+            '?' in normalized
+            or any(token in self.QUESTION_WORDS for token in tokens[:3])
+            or any(lower_query.startswith(verb) for verb in self.DIRECTIVE_VERBS)
+        )
+
+        generic_opening = bool(tokens) and tokens[0] in self.GENERIC_NOUNS
+        features.ambiguity = features.anaphora or features.polysemy or generic_opening
+
+        # Мismatch: комбинация вопросительных и повелительных маркеров одновременно
+        question_like = any(token in self.QUESTION_WORDS for token in tokens)
+        imperative_like = any(verb in lower_query for verb in self.DIRECTIVE_VERBS)
+        features.mismatch = question_like and imperative_like and '?' not in normalized
+
+        # Индекс ясности: уменьшаем за каждый признак, требующий вмешательства
+        penalties = [
+            features.anaphora, features.subordination, features.mismatch,
+            features.presupposition, features.rarity, features.negation,
+            features.superlative, features.polysemy, features.subjectivity,
+            features.ambiguity, features.constraints
+        ]
+        penalty = sum(0.08 for flag in penalties if flag)
+        features.clarity_score = max(0.0, min(1.0, 1.0 - penalty))
+        features.confidence = 0.5 + 0.5 * features.clarity_score
+
+        return features
+
+    def summarize(self, features: QueryFeatures) -> str:
+        """Готовит краткое текстовое описание ключевых признаков."""
+        descriptions = {
+            'anaphora': 'есть анафорические ссылки',
+            'subordination': 'сложноподчинённые конструкции',
+            'mismatch': 'смешение вопросительной и повелительной формы',
+            'presupposition': 'скрытые предпосылки',
+            'pragmatics': 'прагматические маркеры',
+            'rarity': 'редкая лексика',
+            'negation': 'отрицания',
+            'superlative': 'превосходная степень',
+            'polysemy': 'многозначные термины',
+            'excessive': 'избыточный объём',
+            'subjectivity': 'субъективные формулировки',
+            'ambiguity': 'общие или двусмысленные слова',
+            'grounding': 'запрос на обоснование источниками',
+            'constraints': 'много ограничений',
+            'entities': 'именованные сущности',
+            'specialization': 'узкоспециализированная терминология'
+        }
+
+        flagged = [descriptions[key] for key in descriptions if getattr(features, key, False)]
+        if not flagged:
+            return "Запрос ясен, критичных признаков не обнаружено."
+
+        summary = "; ".join(flagged)
+        summary += f". Индекс ясности: {features.clarity_score:.2f}"
+        return summary
+
+
+class RewriteStrategy(Enum):
+    """Перечень стратегий переформулировки запросов."""
+
+    NO_REWRITE = "no_rewrite"
+    PARAPHRASE = "paraphrase"
+    SIMPLIFY = "simplify"
+    DISAMBIGUATE = "disambiguate"
+    EXPAND = "expand"
+    CLARIFY = "clarify"
+
+
+@dataclass
+class QueryOptimizationResult:
+    """Результат адаптивной переформулировки запроса."""
+
+    original_query: str
+    optimized_query: str
+    strategy: RewriteStrategy
+    features: QueryFeatures
+    feature_summary: str
+    notes: List[str] = field(default_factory=list)
+    duration: float = 0.0
+
+    @property
+    def changed(self) -> bool:
+        return self._normalize(self.optimized_query) != self._normalize(self.original_query)
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {
+            "original_query": self.original_query,
+            "optimized_query": self.optimized_query,
+            "strategy": self.strategy.value,
+            "changed": self.changed,
+            "feature_summary": self.feature_summary,
+            "features": self.features.to_dict(),
+            "notes": self.notes,
+            "duration": self.duration
+        }
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+class RewriteStrategySelector:
+    """Определяет подходящую стратегию переформулировки по признакам."""
+
+    def __init__(self, clarity_threshold: float = 0.68):
+        self.clarity_threshold = clarity_threshold
+
+    def select(self, features: QueryFeatures) -> RewriteStrategy:
+        if (
+            features.clarity_score >= self.clarity_threshold
+            and not features.ambiguity
+            and not features.subordination
+            and not features.rarity
+            and not features.constraints
+            and not features.polysemy
+        ):
+            return RewriteStrategy.NO_REWRITE
+
+        scores: Dict[RewriteStrategy, float] = {
+            RewriteStrategy.PARAPHRASE: 0.0,
+            RewriteStrategy.SIMPLIFY: 0.0,
+            RewriteStrategy.DISAMBIGUATE: 0.0,
+            RewriteStrategy.EXPAND: 0.0,
+            RewriteStrategy.CLARIFY: 0.0
+        }
+
+        if features.subordination:
+            scores[RewriteStrategy.DISAMBIGUATE] += 1.0
+            scores[RewriteStrategy.SIMPLIFY] += 0.4
+
+        if features.pragmatics:
+            scores[RewriteStrategy.SIMPLIFY] += 1.0
+
+        if features.constraints:
+            scores[RewriteStrategy.EXPAND] += 0.8
+            scores[RewriteStrategy.CLARIFY] += 0.2
+
+        if features.specialization:
+            scores[RewriteStrategy.EXPAND] += 0.7
+            scores[RewriteStrategy.CLARIFY] += 0.5
+
+        if features.rarity:
+            scores[RewriteStrategy.CLARIFY] += 1.0
+
+        if features.polysemy or features.anaphora or features.ambiguity:
+            scores[RewriteStrategy.DISAMBIGUATE] += 1.1
+            scores[RewriteStrategy.CLARIFY] += 0.4
+
+        if features.answerability:
+            scores[RewriteStrategy.PARAPHRASE] += 0.9
+
+        if features.excessive:
+            scores[RewriteStrategy.SIMPLIFY] += 0.6
+
+        if features.grounding:
+            scores[RewriteStrategy.EXPAND] += 0.3
+
+        if features.subjectivity:
+            scores[RewriteStrategy.CLARIFY] += 0.3
+
+        if features.mismatch or features.presupposition:
+            scores[RewriteStrategy.DISAMBIGUATE] += 0.5
+
+        best_strategy = max(scores, key=scores.get)
+        best_score = scores[best_strategy]
+
+        if best_score <= 0.0:
+            return RewriteStrategy.NO_REWRITE if features.clarity_score >= 0.5 else RewriteStrategy.SIMPLIFY
+
+        return best_strategy
+
+
+class BaseQueryRewriter:
+    """Базовый класс для стратегий переформулировки."""
+
+    def __init__(self, gigachat_client: 'GigaChatClient', strategy: RewriteStrategy):
+        self.client = gigachat_client
+        self.strategy = strategy
+
+    def rewrite(self, query: str, feature_summary: str = "") -> str:
+        raise NotImplementedError
+
+
+class LLMQueryRewriter(BaseQueryRewriter):
+    """Универсальный LLM-реализатор стратегий переформулировки."""
+
+    def __init__(self, gigachat_client: 'GigaChatClient', strategy: RewriteStrategy, prompt_template: str):
+        super().__init__(gigachat_client, strategy)
+        self.prompt_template = prompt_template
+
+    def rewrite(self, query: str, feature_summary: str = "") -> str:
+        system_prompt = (
+            "Ты эксперт по переписыванию пользовательских запросов. Действуй аккуратно, "
+            "не искажай намерение и отвечай только новой формулировкой без пояснений."
+        )
+        prompt = self.prompt_template.format(query=query)
+        if feature_summary:
+            prompt += f"\n\nКонтекст признаков запроса: {feature_summary}"
+
+        try:
+            response = self.client.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=300
+            )
+
+            if response and 'choices' in response:
+                content = response['choices'][0]['message']['content'].strip()
+                return self._cleanup_response(content) or query
+
+        except Exception as exc:
+            logger.warning("Не удалось переписать запрос стратегией %s: %s", self.strategy.value, exc)
+
+        return query
+
+    @staticmethod
+    def _cleanup_response(text: str) -> str:
+        if not text:
+            return ""
+
+        cleaned = text.strip()
+        if cleaned.startswith('```'):
+            cleaned = re.sub(r"```[a-zA-Z]*", "", cleaned)
+            cleaned = cleaned.replace('```', '')
+        cleaned = cleaned.strip()
+        if '\n' in cleaned:
+            cleaned = cleaned.split('\n')[0].strip()
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            cleaned = cleaned[1:-1].strip()
+        return cleaned
+
+
+class QueryOptimizer:
+    """Оркестратор адаптивной переформулировки запросов."""
+
+    def __init__(
+        self,
+        gigachat_client: 'GigaChatClient',
+        feature_extractor: Optional[QueryFeatureExtractor] = None,
+        strategy_selector: Optional[RewriteStrategySelector] = None
+    ):
+        self.client = gigachat_client
+        self.feature_extractor = feature_extractor or QueryFeatureExtractor()
+        self.strategy_selector = strategy_selector or RewriteStrategySelector()
+        self.rewriters: Dict[RewriteStrategy, LLMQueryRewriter] = {
+            RewriteStrategy.PARAPHRASE: LLMQueryRewriter(
+                gigachat_client,
+                RewriteStrategy.PARAPHRASE,
+                "Перефразируй следующий вопрос, сохранив его смысл, но используя другие слова и структуру: {query}"
+            ),
+            RewriteStrategy.SIMPLIFY: LLMQueryRewriter(
+                gigachat_client,
+                RewriteStrategy.SIMPLIFY,
+                "Упрости следующий вопрос, убрав сложные конструкции и вложенные предложения: {query}"
+            ),
+            RewriteStrategy.DISAMBIGUATE: LLMQueryRewriter(
+                gigachat_client,
+                RewriteStrategy.DISAMBIGUATE,
+                "Уточни все неоднозначные термины и местоимения в следующем вопросе: {query}"
+            ),
+            RewriteStrategy.EXPAND: LLMQueryRewriter(
+                gigachat_client,
+                RewriteStrategy.EXPAND,
+                "Расширь следующий вопрос, добавив релевантный контекст и детали: {query}"
+            ),
+            RewriteStrategy.CLARIFY: LLMQueryRewriter(
+                gigachat_client,
+                RewriteStrategy.CLARIFY,
+                "Определи и разъясни специализированные или редкие термины в следующем вопросе: {query}"
+            )
+        }
+
+    def optimize_query(self, original_query: str) -> QueryOptimizationResult:
+        start_time = time.time()
+        features = self.feature_extractor.extract(original_query)
+        feature_summary = self.feature_extractor.summarize(features)
+        strategy = self.strategy_selector.select(features)
+        optimized_query = original_query
+        notes: List[str] = []
+
+        if strategy == RewriteStrategy.NO_REWRITE:
+            notes.append("Переформулировка не потребовалась")
+        else:
+            rewriter = self.rewriters.get(strategy)
+            if rewriter is None:
+                notes.append("Стратегия не поддерживается, оставлена исходная формулировка")
+                strategy = RewriteStrategy.NO_REWRITE
+            else:
+                candidate = rewriter.rewrite(original_query, feature_summary)
+                candidate_normalized = self._normalize(candidate)
+                original_normalized = self._normalize(original_query)
+                if candidate_normalized and candidate_normalized != original_normalized:
+                    optimized_query = candidate
+                    notes.append(f"Применена стратегия {strategy.value}")
+                else:
+                    strategy = RewriteStrategy.NO_REWRITE
+                    optimized_query = original_query
+                    notes.append("Переписанный запрос не дал улучшений, используется исходный текст")
+
+        duration = time.time() - start_time
+
+        return QueryOptimizationResult(
+            original_query=original_query,
+            optimized_query=optimized_query,
+            strategy=strategy,
+            features=features,
+            feature_summary=feature_summary,
+            notes=notes,
+            duration=duration
+        )
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip().lower()
+
+class ResponseEvaluator:
+    """Оценивает качество ответа на основе комбинированной награды."""
+
+    def __init__(
+        self,
+        gigachat_client: Optional['GigaChatClient'] = None,
+        weights: Tuple[float, float, float] = (0.6, 0.3, 0.1)
+    ):
+        self.client = gigachat_client
+        self.weights = weights
+
+    def evaluate(self, response: str, reference: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not response or not reference:
+            return None
+
+        reward, components = self.calculate_reward(response, reference)
+        components['reward'] = reward
+        components['weights'] = list(self.weights)
+        return components
+
+    def calculate_reward(
+        self,
+        response: str,
+        reference: str,
+        weights: Optional[Tuple[float, float, float]] = None
+    ) -> Tuple[float, Dict[str, float]]:
+        weights = weights or self.weights
+        alpha, beta, gamma = weights
+
+        s_llm = self._llm_judge_score(response, reference)
+        s_fuzz = self._fuzzy_match_score(response, reference)
+        s_bleu = self._bleu1(response, reference)
+
+        reward = alpha * s_llm + beta * s_fuzz + gamma * s_bleu
+        return reward, {'llm': s_llm, 'fuzzy': s_fuzz, 'bleu1': s_bleu}
+
+    def _llm_judge_score(self, response: str, reference: str) -> float:
+        if not response or not reference:
+            return 0.0
+
+        if not self.client:
+            return self._heuristic_semantic_score(response, reference)
+
+        prompt = (
+            "Оцени, насколько ответ ассистента соответствует референсу по смыслу и фактам. "
+            "Верни JSON вида {\"score\": число от 0 до 1}."
+            f"\n\nРЕФЕРЕНС:\n{reference}\n\nОТВЕТ:\n{response}"
+        )
+
+        try:
+            evaluation = self.client.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты строгий судья качества ответов. Оцени точность и полноту, не добавляй лишний текст."
+                        )
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=200
+            )
+            if evaluation and 'choices' in evaluation:
+                content = evaluation['choices'][0]['message']['content']
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    try:
+                        data = json.loads(json_match.group())
+                        score = float(data.get('score', 0.0))
+                        return max(0.0, min(1.0, score))
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        pass
+                number_match = re.search(r"0?\.\d+|1\.0", content)
+                if number_match:
+                    try:
+                        score = float(number_match.group())
+                        return max(0.0, min(1.0, score))
+                    except ValueError:
+                        pass
+        except Exception:
+            logger.debug("LLM-оценка не удалась, используем эвристику", exc_info=True)
+
+        return self._heuristic_semantic_score(response, reference)
+
+    def _heuristic_semantic_score(self, response: str, reference: str) -> float:
+        response_tokens = set(self._normalize_tokens(response))
+        reference_tokens = set(self._normalize_tokens(reference))
+        if not reference_tokens:
+            return 0.0
+        overlap = len(response_tokens & reference_tokens)
+        return overlap / max(len(reference_tokens), 1)
+
+    def _fuzzy_match_score(self, response: str, reference: str) -> float:
+        if not response or not reference:
+            return 0.0
+        return difflib.SequenceMatcher(None, response, reference).ratio()
+
+    def _bleu1(self, response: str, reference: str) -> float:
+        response_tokens = self._normalize_tokens(response)
+        reference_tokens = self._normalize_tokens(reference)
+        if not response_tokens or not reference_tokens:
+            return 0.0
+
+        response_counts = Counter(response_tokens)
+        reference_counts = Counter(reference_tokens)
+        overlap = sum(min(response_counts[token], reference_counts[token]) for token in response_counts)
+        precision = overlap / len(response_tokens)
+
+        if len(response_tokens) < len(reference_tokens) and len(response_tokens) > 0:
+            brevity_penalty = math.exp(1 - len(reference_tokens) / max(len(response_tokens), 1))
+        else:
+            brevity_penalty = 1.0
+
+        return precision * brevity_penalty
+
+    @staticmethod
+    def _normalize_tokens(text: str) -> List[str]:
+        return re.findall(r"[\wёЁ]+", (text or '').lower())
+
+
 class AdvancedIntentAnalyzer:
     """Продвинутый анализатор намерений пользователя с метарассуждениями."""
     
@@ -194,9 +763,9 @@ class AdvancedIntentAnalyzer:
             'создай файл', 'отчет', 'xlsx', 'csv'
         ]
     
-    def analyze_with_llm(self, query: str) -> TaskContext:
+    def analyze_with_llm(self, query: str, original_query: Optional[str] = None) -> TaskContext:
         """Анализирует запрос с помощью LLM для глубокого понимания намерений."""
-        
+
         analysis_prompt = f"""Я - продвинутый аналитик задач. Мне нужно проанализировать запрос пользователя и понять его истинные намерения. Я не допускаю ленивых выводов и отмечаю потребность в инструментах, если она присутствует.
 
 ТЕКУЩАЯ ДАТА: {CURRENT_DATE_FORMATTED}
@@ -291,16 +860,17 @@ class AdvancedIntentAnalyzer:
                             'reasoning': analysis_data.get('reasoning', ''),
                             'llm_analysis': True
                         },
-                        timestamp=CURRENT_DATE
+                        timestamp=CURRENT_DATE,
+                        original_query=original_query or query
                     )
-        
+
         except Exception as e:
             logger.warning(f"LLM анализ не удался, используем базовый: {e}")
-        
+
         # Fallback на базовый анализ
-        return self._basic_analysis(query)
-    
-    def _basic_analysis(self, query: str) -> TaskContext:
+        return self._basic_analysis(query, original_query)
+
+    def _basic_analysis(self, query: str, original_query: Optional[str] = None) -> TaskContext:
         """Базовый анализ намерений (fallback)."""
         query_lower = query.lower()
         
@@ -345,7 +915,8 @@ class AdvancedIntentAnalyzer:
             domain=domain,
             keywords=keywords,
             timestamp=CURRENT_DATE,
-            meta_analysis={'llm_analysis': False}
+            meta_analysis={'llm_analysis': False},
+            original_query=original_query or query
         )
     
     def _extract_keywords(self, text: str) -> List[str]:
@@ -2919,8 +3490,10 @@ class SmartAgent:
 
     def __init__(self, gigachat_client: GigaChatClient):
         self.client = gigachat_client
+        self.query_optimizer = QueryOptimizer(gigachat_client)
         self.intent_analyzer = AdvancedIntentAnalyzer(gigachat_client)
         self.task_planner = AdvancedTaskPlanner(gigachat_client)
+        self.response_evaluator = ResponseEvaluator(gigachat_client)
         
         # Инициализируем инструменты
         self.web_search = WebSearchTool()
@@ -3644,6 +4217,24 @@ class SmartAgent:
         if context.meta_analysis.get('reasoning') if context.meta_analysis else None:
             reasoning_hint = "АНАЛИЗ НАМЕРЕНИЙ:\n" + context.meta_analysis['reasoning']
 
+        rewrite_section = ""
+        optimization_meta = context.meta_analysis.get('query_optimization') if context.meta_analysis else None
+        if optimization_meta and optimization_meta.get('changed'):
+            details = [
+                f"Исходная формулировка: \"{optimization_meta.get('original_query', context.original_query or '')}\"",
+                f"Стратегия переписывания: {optimization_meta.get('strategy', context.rewrite_strategy)}"
+            ]
+            feature_summary = optimization_meta.get('feature_summary')
+            if feature_summary:
+                details.append(f"Ключевые наблюдения: {feature_summary}")
+            rewrite_section = "МОЯ ПОДГОТОВКА ЗАПРОСА:\n- " + "\n- ".join(details)
+        elif context.original_query and context.original_query != context.query:
+            rewrite_section = (
+                "МОЯ ПОДГОТОВКА ЗАПРОСА:\n"
+                f"- Исходная формулировка: \"{context.original_query}\"\n"
+                f"- Рабочая формулировка: \"{context.query}\""
+            )
+
         excel_guidance = f"\n{excel_info}" if excel_info else ""
         return f"""Я - продвинутый интеллектуальный агент X-Master v77 Enhanced. Моя роль - эффективно решать задачи пользователей, используя доступные инструменты и глубокий анализ.
 
@@ -3656,6 +4247,8 @@ class SmartAgent:
 🌍 Область: {context.domain}
 ⏰ Срочность: {context.urgency}
 🕐 Временной контекст: {context.temporal_context}
+
+{rewrite_section if rewrite_section else ''}
 
 {tools_status}
 
@@ -3710,9 +4303,28 @@ class SmartAgent:
         """Обрабатывает запрос пользователя с улучшенным анализом."""
         logger.info(f"Начинаю обработку запроса: {query}")
         logger.info(f"Текущая дата для контекста: {CURRENT_DATE_FORMATTED}")
-        
+
+        optimization = self.query_optimizer.optimize_query(query)
+        optimized_query = optimization.optimized_query
+        logger.info(
+            "Оптимизация запроса завершена: стратегия=%s, изменён=%s",
+            optimization.strategy.value,
+            optimization.changed
+        )
+        if optimization.notes:
+            for note in optimization.notes:
+                logger.info("Оптимизация: %s", note)
+        logger.debug("Краткое описание признаков запроса: %s", optimization.feature_summary)
+
         # Глубокий анализ намерений с помощью LLM
-        context = self.intent_analyzer.analyze_with_llm(query)
+        context = self.intent_analyzer.analyze_with_llm(optimized_query, original_query=query)
+        context.query = optimized_query
+        context.original_query = query
+        context.rewrite_strategy = optimization.strategy.value
+        context.rewrite_features = optimization.features.to_dict()
+        if not context.meta_analysis:
+            context.meta_analysis = {}
+        context.meta_analysis['query_optimization'] = optimization.to_metadata()
         logger.info(f"Результат анализа намерений: {context}")
         
         # Создаем умный план выполнения
@@ -3733,7 +4345,13 @@ class SmartAgent:
         system_prompt = self.build_enhanced_system_prompt(context, plan)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query}
+            {
+                "role": "user",
+                "content": query if not optimization.changed else (
+                    f"Исходный запрос пользователя: {query}\n"
+                    f"Уточнённая формулировка для работы: {optimized_query}"
+                )
+            }
         ]
         self.metacognition.record_system_prompt(system_prompt)
 
@@ -3973,8 +4591,19 @@ class SmartAgent:
             'plan_completion_percent': plan_completion_percent,
             'plan_adherence_percent': plan_adherence_percent,
             'iterations_used': iterations_used,
-            'plan_progress': plan_progress_payload
+            'plan_progress': plan_progress_payload,
+            'query_optimization': optimization.to_metadata()
         }
+
+        evaluation_payload = None
+        reference_answer = None
+        if context.meta_analysis:
+            reference_answer = context.meta_analysis.get('reference_answer') or context.meta_analysis.get('expected_answer')
+        if final_answer and reference_answer:
+            evaluation_payload = self.response_evaluator.evaluate(final_answer, reference_answer)
+            if evaluation_payload:
+                final_summary_payload['evaluation'] = evaluation_payload
+
         self.metacognition.finalize(final_answer, final_summary_payload)
 
         return {
@@ -4000,7 +4629,10 @@ class SmartAgent:
             'plan_reasoning': plan.reasoning,
             'quality_score': quality_score,
             'risk_assessment': plan.risk_assessment,
-            'iteration_limit': iteration_limit
+            'iteration_limit': iteration_limit,
+            'query_optimization': optimization.to_metadata(),
+            'optimized_query': optimized_query,
+            'evaluation': evaluation_payload
         }
 
 
