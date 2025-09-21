@@ -855,9 +855,10 @@ class GigaChatClient:
                 logger.error(f"Ошибка получения GigaChat токена: {e}")
                 raise
 
-    def chat(self, messages: List[Dict], functions: Optional[List[Dict]] = None, 
-             temperature: float = 0.3, max_tokens: int = 4096, 
-             function_call: Union[str, Dict] = "auto"):
+    def chat(self, messages: List[Dict], functions: Optional[List[Dict]] = None,
+             temperature: float = 0.3, max_tokens: int = 4096,
+             function_call: Union[str, Dict] = "auto",
+             functions_state_id: Optional[str] = None):
         """Отправляет запрос в GigaChat API."""
         token = self._get_token()
         url = f"{self.base_url}/chat/completions"
@@ -869,6 +870,9 @@ class GigaChatClient:
             "max_tokens": max_tokens,
             "stream": False
         }
+
+        if functions_state_id is not None:
+            data["functions_state_id"] = functions_state_id
         
         if functions:
             data["functions"] = functions
@@ -3513,6 +3517,7 @@ class SmartAgent:
         lazy_response_attempts = 0
         focus_reinforcements = 0
         max_focus_reinforcements = 3
+        functions_state_id: Optional[str] = None
 
         iteration_limit = max(max_iterations, len(plan.steps) * 2 if plan.steps else max_iterations)
         if iteration_limit != max_iterations:
@@ -3527,7 +3532,8 @@ class SmartAgent:
                     messages=messages,
                     functions=self.get_available_functions(),
                     temperature=0.2,  # Снижаем температуру для более точного следования плану
-                    function_call="auto"
+                    function_call="auto",
+                    functions_state_id=functions_state_id
                 )
                 
                 if not response or 'choices' not in response:
@@ -3536,13 +3542,20 @@ class SmartAgent:
                 
                 choice = response['choices'][0]
                 message = choice['message']
-                
+                functions_state_id = (
+                    message.get('functions_state_id')
+                    or choice.get('functions_state_id')
+                    or response.get('functions_state_id')
+                    or functions_state_id
+                )
+
                 # Добавляем сообщение в диалог
-                messages.append({
-                    "role": message['role'],
-                    "content": message.get('content', ''),
-                    "function_call": message.get('function_call')
-                })
+                assistant_message: Dict[str, Any] = {"role": message['role']}
+                content = message.get('content')
+                assistant_message["content"] = content if content is not None else ""
+                if message.get('function_call'):
+                    assistant_message["function_call"] = message.get('function_call')
+                messages.append(assistant_message)
                 
                 # Обрабатываем вызов функции
                 if 'function_call' in message:
@@ -3617,28 +3630,35 @@ class SmartAgent:
                         note=progress_info.get('note')
                     )
 
+                    # Добавляем результат в диалог с дополнительным контекстом
+                    function_payload = {
+                        "success": result.success,
+                        "data": str(result.data)[:2000] if result.data is not None else None,
+                        "error": result.error,
+                        "metadata": result.metadata,
+                        "confidence": result.confidence,
+                        "execution_time": result.execution_time,
+                        "plan_progress": plan_progress_payload,
+                        "plan_note": progress_info.get('note'),
+                        "plan_summary": progress_info.get('summary')
+                    }
+                    try:
+                        function_content = json.dumps(function_payload, ensure_ascii=False, default=str)
+                    except TypeError:
+                        sanitized_payload = {key: str(value) for key, value in function_payload.items()}
+                        function_content = json.dumps(sanitized_payload, ensure_ascii=False)
+
+                    function_response = {
+                        "role": "function",
+                        "name": func_name or "unknown_function",
+                        "content": function_content
+                    }
+                    messages.append(function_response)
+
                     # Проверяем на завершение задачи
                     if func_name == "finish_task" and result.success:
                         final_answer = result.data
                         break
-                    
-                    # Добавляем результат в диалог с дополнительным контекстом
-                    function_response = {
-                        "role": "function",
-                        "name": func_name,
-                        "content": json.dumps({
-                            "success": result.success,
-                            "data": str(result.data)[:2000] if result.data else None,  # Увеличиваем лимит
-                            "error": result.error,
-                            "metadata": result.metadata,
-                            "confidence": result.confidence,
-                            "execution_time": result.execution_time,
-                            "plan_progress": plan_progress_payload,
-                            "plan_note": progress_info.get('note'),
-                            "plan_summary": progress_info.get('summary')
-                        }, ensure_ascii=False)
-                    }
-                    messages.append(function_response)
                 
                 else:
                     # Модель ответила без вызова функции
