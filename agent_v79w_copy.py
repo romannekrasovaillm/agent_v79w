@@ -12,6 +12,7 @@ import random
 import string
 import logging
 import requests
+import ast
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
@@ -470,32 +471,30 @@ class AdvancedTaskPlanner:
     "adaptability_level": "low/medium/high"
 }}"""
 
+        plan_data: Optional[Dict[str, Any]] = None
+
         try:
             messages = [
                 {"role": "system", "content": "Ты - эксперт по планированию задач. Создавай эффективные планы в формате JSON."},
                 {"role": "user", "content": planning_prompt}
             ]
-            
+
             response = self.client.chat(
                 messages=messages,
                 temperature=0.2,
                 max_tokens=2048
             )
-            
+
             if response and 'choices' in response:
                 content = response['choices'][0]['message']['content']
-                
-                # Извлекаем JSON из ответа
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    plan_data = json.loads(json_match.group())
-                    
-                    # Адаптируем шаги под контекст
+                plan_data, parse_error = self._parse_plan_response(content)
+
+                if plan_data:
                     adapted_steps = []
                     for step in plan_data.get('steps', []):
                         adapted_step = self._adapt_step_to_context(step, context)
                         adapted_steps.append(adapted_step)
-                    
+
                     return ExecutionPlan(
                         steps=adapted_steps,
                         reasoning=plan_data.get('reasoning', ''),
@@ -509,13 +508,188 @@ class AdvancedTaskPlanner:
                         completed_steps=0,
                         progress_notes=[]
                     )
-        
+
+                if parse_error:
+                    logger.debug(f"Не удалось распарсить ответ планировщика: {parse_error}")
+
         except Exception as e:
             logger.warning(f"LLM планирование не удалось, используем базовое: {e}")
-        
+
         # Fallback на базовое планирование
         return self._create_basic_plan(context)
-    
+
+    def _parse_plan_response(self, content: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Пытается преобразовать ответ LLM в структуру плана."""
+        if not content:
+            return None, "Пустой ответ модели"
+
+        candidates = self._extract_json_candidates(content)
+        if not candidates:
+            return None, "В ответе отсутствует JSON-блок"
+
+        last_error: Optional[str] = None
+
+        for candidate in candidates:
+            variants = [candidate]
+            normalized = self._normalize_json_text(candidate)
+            if normalized and normalized not in variants:
+                variants.append(normalized)
+
+            for variant in variants:
+                try:
+                    parsed = json.loads(variant)
+                    if isinstance(parsed, dict):
+                        return parsed, None
+                except json.JSONDecodeError as json_error:
+                    last_error = f"JSONDecodeError: {json_error}"
+
+                    python_ready = self._prepare_for_python_eval(variant)
+                    if python_ready:
+                        try:
+                            parsed = ast.literal_eval(python_ready)
+                            if isinstance(parsed, dict):
+                                return parsed, None
+                        except (ValueError, SyntaxError) as python_error:
+                            last_error = f"{python_error}"
+
+        return None, last_error or "Не удалось преобразовать ответ в JSON"
+
+    def _extract_json_candidates(self, content: str) -> List[str]:
+        """Извлекает потенциальные JSON-блоки из ответа модели."""
+        candidates: List[str] = []
+        if not content:
+            return candidates
+
+        code_block_pattern = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+        for match in code_block_pattern.finditer(content):
+            candidate = match.group(1).strip()
+            if candidate:
+                candidates.append(candidate)
+
+        if candidates:
+            return candidates
+
+        start_index: Optional[int] = None
+        depth = 0
+        for index, char in enumerate(content):
+            if char == '{':
+                if depth == 0:
+                    start_index = index
+                depth += 1
+            elif char == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_index is not None:
+                        block = content[start_index:index + 1].strip()
+                        if block:
+                            candidates.append(block)
+                        start_index = None
+
+        if not candidates:
+            stripped = content.strip()
+            if stripped.startswith('{') and stripped.endswith('}'):
+                candidates.append(stripped)
+
+        return candidates
+
+    def _normalize_json_text(self, text: str) -> str:
+        """Приводит текст к более валидной JSON-форме."""
+        if not text:
+            return ''
+
+        sanitized = text.strip()
+        sanitized = re.sub(r'//.*?(?=\n|$)', '', sanitized)
+        sanitized = re.sub(r'/\*.*?\*/', '', sanitized, flags=re.DOTALL)
+        sanitized = re.sub(r',\s*(?=[}\]])', '', sanitized)
+        sanitized = self._quote_unquoted_keys(sanitized)
+
+        def replace_single_quotes(match: re.Match) -> str:
+            inner = match.group(1)
+            inner = inner.replace("\\'", "'")
+            inner = inner.replace('"', '\\"')
+            return f'"{inner}"'
+
+        sanitized = re.sub(r"(?<!\\)'([^'\\]*(?:\\.[^'\\]*)*)'", replace_single_quotes, sanitized)
+        return sanitized
+
+    def _quote_unquoted_keys(self, text: str) -> str:
+        """Добавляет кавычки к незаключенным в них ключам JSON."""
+        if not text:
+            return text
+
+        key_pattern = re.compile(
+            r'(?P<prefix>[\{\[,]\s*)(?P<key>[A-Za-zА-Яа-я0-9_\-]+(?:\s+[A-Za-zА-Яа-я0-9_\-]+)*)\s*:'
+        )
+        text = key_pattern.sub(lambda m: f"{m.group('prefix')}\"{m.group('key')}\":", text)
+
+        start_pattern = re.compile(
+            r'^(?P<key>[A-Za-zА-Яа-я0-9_\-]+(?:\s+[A-Za-zА-Яа-я0-9_\-]+)*)\s*:',
+            re.MULTILINE
+        )
+        text = start_pattern.sub(lambda m: f'"{m.group("key")}":', text)
+
+        return text
+
+    def _prepare_for_python_eval(self, text: str) -> str:
+        """Преобразует JSON-подобный текст к синтаксису Python для literal_eval."""
+        if not text:
+            return ''
+
+        normalized = self._normalize_json_text(text)
+        if not normalized:
+            return normalized
+
+        return self._replace_json_literals(normalized)
+
+    def _replace_json_literals(self, text: str) -> str:
+        """Заменяет JSON-литералы на эквиваленты Python вне строк."""
+        if not text:
+            return ''
+
+        result: List[str] = []
+        in_single = False
+        in_double = False
+        index = 0
+        length = len(text)
+
+        while index < length:
+            char = text[index]
+
+            if char == '"' and not in_single:
+                escaped = index > 0 and text[index - 1] == '\\'
+                if not escaped:
+                    in_double = not in_double
+                result.append(char)
+                index += 1
+                continue
+
+            if char == "'" and not in_double:
+                escaped = index > 0 and text[index - 1] == '\\'
+                if not escaped:
+                    in_single = not in_single
+                result.append(char)
+                index += 1
+                continue
+
+            if not in_single and not in_double:
+                if text.startswith('true', index):
+                    result.append('True')
+                    index += 4
+                    continue
+                if text.startswith('false', index):
+                    result.append('False')
+                    index += 5
+                    continue
+                if text.startswith('null', index):
+                    result.append('None')
+                    index += 4
+                    continue
+
+            result.append(char)
+            index += 1
+
+        return ''.join(result)
+
     def _adapt_step_to_context(self, step: Dict, context: TaskContext) -> Dict:
         """Адаптирует шаг под конкретный контекст задачи."""
         adapted = step.copy()
