@@ -499,19 +499,42 @@ class AdvancedTaskPlanner:
                         adapted_steps.append(adapted_step)
 
                     adapted_steps = self._postprocess_steps(adapted_steps, context)
+                    adapted_steps, adjustments = self._apply_planning_best_practices(adapted_steps, context)
+
+                    base_time = max(1, len(adapted_steps)) * 4.0
+                    complexity_multiplier = {
+                        'simple': 1.0,
+                        'medium': 1.25,
+                        'complex': 1.5
+                    }.get(context.complexity, 1.0)
+                    estimated_time = max(plan_data.get('estimated_time', 30.0), base_time * complexity_multiplier)
+
+                    success_criteria = plan_data.get('success_criteria', [])
+                    if not isinstance(success_criteria, list):
+                        success_criteria = []
+                    if not success_criteria:
+                        success_criteria = self._generate_success_criteria(context, adapted_steps)
+
+                    reasoning = plan_data.get('reasoning', '')
+                    if adjustments:
+                        reasoning = (
+                            reasoning + "\n\n" if reasoning else ""
+                        ) + "Корректировки плана:\n" + "\n".join(f"- {note}" for note in adjustments)
+
+                    progress_notes = adjustments[:5] if adjustments else []
 
                     return ExecutionPlan(
                         steps=adapted_steps,
-                        reasoning=plan_data.get('reasoning', ''),
-                        estimated_time=plan_data.get('estimated_time', 30.0),
+                        reasoning=reasoning,
+                        estimated_time=estimated_time,
                         confidence=plan_data.get('confidence', 0.8),
                         risk_assessment=plan_data.get('risk_assessment', {}),
-                        success_criteria=plan_data.get('success_criteria', []),
+                        success_criteria=success_criteria,
                         adaptability_level=plan_data.get('adaptability_level', 'medium'),
                         fallback_plan=self._create_fallback_plan(context),
                         current_step_index=0,
                         completed_steps=0,
-                        progress_notes=[]
+                        progress_notes=progress_notes
                     )
 
                 if parse_error:
@@ -917,6 +940,233 @@ class AdvancedTaskPlanner:
 
         return processed_steps
 
+    def _apply_planning_best_practices(self, steps: List[Dict[str, Any]], context: TaskContext) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Обогащает шаги плана лучшими практиками и добавляет недостающие этапы."""
+
+        if steps is None:
+            steps = []
+
+        enhanced_steps: List[Dict[str, Any]] = []
+        adjustments: List[str] = []
+
+        for index, raw_step in enumerate(steps):
+            step = raw_step.copy()
+            tool_name = step.get('tool')
+            if not tool_name:
+                tool_name = f"step_{index + 1}"
+                step['tool'] = tool_name
+                adjustments.append(
+                    f"Шаг {index + 1} не содержал название инструмента и был переименован в {tool_name}"
+                )
+
+            if not step.get('description'):
+                step['description'] = self._default_step_description(tool_name)
+
+            if not step.get('expected_outcome'):
+                step['expected_outcome'] = self._default_expected_outcome(tool_name, context)
+                adjustments.append(f"Для шага {tool_name} установлен ожидаемый результат по умолчанию")
+
+            phase = self._determine_phase(tool_name)
+            step['phase'] = phase
+
+            notes = step.get('best_practice_notes')
+            if isinstance(notes, list):
+                best_practice_notes = notes
+            elif notes:
+                best_practice_notes = [str(notes)]
+            else:
+                best_practice_notes = []
+
+            note_hint = None
+            if phase == 'gather':
+                note_hint = 'Собери все необходимые данные перед анализом'
+            elif phase == 'analysis':
+                note_hint = 'Проведи анализ и зафиксируй ключевые выводы'
+            elif phase == 'delivery':
+                note_hint = 'Сформулируй выводы и подготовь результат для пользователя'
+
+            if note_hint and note_hint not in best_practice_notes:
+                best_practice_notes.append(note_hint)
+
+            step['best_practice_notes'] = best_practice_notes
+            enhanced_steps.append(step)
+
+        tools_present: Set[str] = {step['tool'] for step in enhanced_steps}
+        additions: List[Dict[str, Any]] = []
+
+        required_tools = [
+            ('requires_search', 'web_search', 'Провести целевой веб-поиск по запросу пользователя'),
+            ('requires_browser', 'browser_navigate', 'Открыть нужный сайт в браузере для сбора данных'),
+            ('requires_computation', 'code_execute', 'Выполнить вычисления и обработку данных в Python'),
+            ('requires_excel', 'excel_export', 'Подготовить выгрузку результатов в формате Excel')
+        ]
+
+        for attr_name, required_tool, description in required_tools:
+            if getattr(context, attr_name, False) and required_tool not in tools_present:
+                new_step = {
+                    'tool': required_tool,
+                    'description': description,
+                    'expected_outcome': self._default_expected_outcome(required_tool, context),
+                    'phase': self._determine_phase(required_tool),
+                    'added_by_best_practices': True,
+                    'best_practice_notes': ['Добавлен автоматически для покрытия требований задачи']
+                }
+                additions.append(new_step)
+                tools_present.add(required_tool)
+                adjustments.append(
+                    f"Добавлен обязательный шаг {required_tool} на основе анализа контекста"
+                )
+
+        if 'finish_task' not in tools_present:
+            finish_step = {
+                'tool': 'finish_task',
+                'description': 'Сформировать финальный ответ и завершить задачу',
+                'expected_outcome': self._default_expected_outcome('finish_task', context),
+                'phase': 'delivery',
+                'added_by_best_practices': True,
+                'best_practice_notes': [
+                    'Собери ключевые выводы по итогам всех шагов',
+                    'Укажи использованные источники и актуальность данных'
+                ],
+                'milestone': True
+            }
+            additions.append(finish_step)
+            tools_present.add('finish_task')
+            adjustments.append('Добавлен завершающий шаг finish_task для фиксации результата')
+
+        has_gather_steps = any(step.get('phase') == 'gather' for step in enhanced_steps + additions)
+        has_analysis_steps = any(
+            step.get('phase') == 'analysis' or step.get('tool') in {'code_execute', 'analyze_results'}
+            for step in enhanced_steps + additions
+        )
+
+        if has_gather_steps and not has_analysis_steps:
+            analysis_note = 'Перед финальным ответом проанализируй собранные данные и сделай выводы'
+            adjustments.append('Добавлена памятка о необходимости анализа данных перед финальным ответом')
+            for step in enhanced_steps + additions:
+                if step.get('tool') == 'finish_task':
+                    existing_notes = step.get('best_practice_notes', [])
+                    if analysis_note not in existing_notes:
+                        existing_notes.append(analysis_note)
+                    step['best_practice_notes'] = existing_notes
+
+        for addition in additions:
+            phase = addition.get('phase')
+            insert_index = len(enhanced_steps)
+            if phase == 'gather':
+                insert_index = next(
+                    (idx for idx, step in enumerate(enhanced_steps) if step.get('phase') not in {'gather', None}),
+                    len(enhanced_steps)
+                )
+            elif phase == 'analysis':
+                insert_index = next(
+                    (idx for idx, step in enumerate(enhanced_steps) if step.get('phase') == 'delivery'),
+                    len(enhanced_steps)
+                )
+            enhanced_steps.insert(insert_index, addition)
+
+        previous_tool: Optional[str] = None
+        for priority, step in enumerate(enhanced_steps, 1):
+            step['priority'] = priority
+
+            depends_on = step.get('depends_on')
+            if isinstance(depends_on, str):
+                depends_on_list = [depends_on]
+            elif isinstance(depends_on, list):
+                depends_on_list = [item for item in depends_on if item]
+            else:
+                depends_on_list = []
+
+            if previous_tool and previous_tool not in depends_on_list:
+                depends_on_list.append(previous_tool)
+
+            step['depends_on'] = depends_on_list
+
+            if step.get('phase') in {'analysis', 'delivery'} and not step.get('checkpoint'):
+                step['checkpoint'] = True
+
+            previous_tool = step.get('tool')
+
+        return enhanced_steps, adjustments
+
+    def _default_step_description(self, tool_name: str) -> str:
+        descriptions = {
+            'web_search': 'Выполнить веб-поиск по ключевым словам запроса',
+            'web_parse': 'Извлечь структурированную информацию с выбранной страницы',
+            'browser_navigate': 'Открыть необходимый веб-сайт в браузере',
+            'browser_extract': 'Собрать данные из DOM выбранной страницы',
+            'browser_click': 'Взаимодействовать с элементом страницы для получения данных',
+            'wait_dynamic_content': 'Дождаться появления динамического контента',
+            'code_execute': 'Запустить Python код для анализа данных',
+            'excel_export': 'Сформировать Excel-файл с результатами исследования',
+            'cbr_key_rate': 'Получить официальные данные по ключевой ставке Банка России',
+            'finish_task': 'Сформулировать финальный ответ пользователю'
+        }
+        return descriptions.get(tool_name, f"Выполнить действие {tool_name}")
+
+    def _default_expected_outcome(self, tool_name: str, context: TaskContext) -> str:
+        outcomes = {
+            'web_search': f"Получены релевантные источники (минимум {max(1, context.expected_sources)} ссылки)",
+            'web_parse': 'Извлечено содержимое целевой страницы с ключевыми фактами',
+            'browser_navigate': 'Открыта нужная страница и подтверждена ее доступность',
+            'browser_extract': 'Собраны необходимые данные с открытой страницы',
+            'browser_click': 'Выполнено взаимодействие на странице и получен ожидаемый результат',
+            'wait_dynamic_content': 'Дождались загрузки динамического контента',
+            'code_execute': 'Проведены вычисления и подготовлены результаты анализа',
+            'excel_export': 'Создан Excel-файл с итоговыми данными и сохранен в рабочей директории',
+            'cbr_key_rate': 'Получено актуальное значение ключевой ставки из официального источника',
+            'finish_task': 'Подготовлен финальный ответ с выводами и ссылками на источники',
+            'analyze_results': 'Синтезированы выводы на основе собранных данных'
+        }
+        return outcomes.get(tool_name, f"Получен результат работы инструмента {tool_name}")
+
+    def _determine_phase(self, tool_name: str) -> str:
+        gather_tools = {
+            'web_search', 'web_parse', 'browser_navigate', 'browser_extract',
+            'browser_click', 'wait_dynamic_content', 'cbr_key_rate', 'read_file', 'ls'
+        }
+        analysis_tools = {'code_execute', 'analyze_results', 'edit_file'}
+        delivery_tools = {'excel_export', 'finish_task', 'write_file'}
+
+        if tool_name in gather_tools:
+            return 'gather'
+        if tool_name in analysis_tools:
+            return 'analysis'
+        if tool_name in delivery_tools:
+            return 'delivery'
+        return 'support'
+
+    def _generate_success_criteria(self, context: TaskContext, steps: List[Dict[str, Any]]) -> List[str]:
+        criteria: List[str] = []
+        tool_set = {step.get('tool') for step in steps}
+        phases = {step.get('phase') for step in steps}
+
+        if 'web_search' in tool_set:
+            min_sources = max(1, context.expected_sources)
+            criteria.append(
+                f"Найти и зафиксировать не менее {min_sources} релевантных источников через web_search"
+            )
+
+        if any(step.get('tool') in {'web_parse', 'browser_extract', 'browser_navigate'} for step in steps):
+            criteria.append('Извлечь ключевые данные из найденных источников и зафиксировать их в заметках')
+
+        if 'cbr_key_rate' in tool_set:
+            criteria.append('Получить значение ключевой ставки Банка России непосредственно с cbr.ru')
+
+        if 'code_execute' in tool_set:
+            criteria.append('Выполнить вычисления в Python и включить результаты в итоговый ответ')
+
+        if 'excel_export' in tool_set:
+            criteria.append('Сформировать файл Excel с итоговыми данными и приложить его в ответе')
+
+        if 'analysis' in phases or 'analysis' in tool_set or 'code_execute' in tool_set:
+            criteria.append('Синтезировать выводы по собранной информации перед финальным ответом')
+
+        if 'finish_task' in tool_set or True:
+            criteria.append('Завершить работу вызовом finish_task с четким и полным ответом для пользователя')
+
+        return criteria
+
     def _create_basic_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает базовый план (fallback)."""
         steps = []
@@ -941,18 +1191,33 @@ class AdvancedTaskPlanner:
             })
 
         steps = self._postprocess_steps(steps, context)
+        steps, adjustments = self._apply_planning_best_practices(steps, context)
 
-        estimated_time = len(steps) * 5.0
+        base_time = max(1, len(steps)) * 4.0
+        complexity_multiplier = {
+            'simple': 1.0,
+            'medium': 1.25,
+            'complex': 1.5
+        }.get(context.complexity, 1.0)
+        estimated_time = base_time * complexity_multiplier
+
+        reasoning = "Базовый план на основе шаблонов"
+        if adjustments:
+            reasoning += "\n\nКорректировки:\n" + "\n".join(f"- {note}" for note in adjustments)
+
+        success_criteria = self._generate_success_criteria(context, steps)
+        initial_notes = adjustments[:5] if adjustments else []
 
         return ExecutionPlan(
             steps=steps,
             estimated_time=estimated_time,
             confidence=0.7,
-            reasoning="Базовый план на основе шаблонов",
+            reasoning=reasoning,
             fallback_plan=self._create_fallback_plan(context),
             current_step_index=0,
             completed_steps=0,
-            progress_notes=[]
+            progress_notes=initial_notes,
+            success_criteria=success_criteria
         )
     
     def _create_fallback_plan(self, context: TaskContext) -> List[Dict]:
