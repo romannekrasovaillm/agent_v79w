@@ -1738,7 +1738,10 @@ class FileSystemTools:
             if not sliced_lines and total_lines == 0:
                 content = "Файл пуст"
             else:
-                numbered = [f"{idx:>6}⟶{line.rstrip('\n')}" for idx, line in enumerate(sliced_lines, start=start + 1)]
+                numbered = []
+                for idx, line in enumerate(sliced_lines, start=start + 1):
+                    stripped_line = line.rstrip('\n')
+                    numbered.append(f"{idx:>6}⟶{stripped_line}")
                 content = "\n".join(numbered)
 
             return ToolResult(
