@@ -116,6 +116,12 @@ class TaskContext:
     user_goal: str = "information"  # information, action, analysis, export
     confidence_score: float = 0.8
     meta_analysis: Dict[str, Any] = field(default_factory=dict)
+    primary_objective: str = ""
+    focus_points: List[str] = field(default_factory=list)
+    output_expectations: List[str] = field(default_factory=list)
+    verification_checks: List[str] = field(default_factory=list)
+    prohibited_actions: List[str] = field(default_factory=list)
+    focus_summary: str = ""
     
 
 @dataclass
@@ -232,7 +238,7 @@ class AdvancedIntentAnalyzer:
                 if json_match:
                     analysis_data = json.loads(json_match.group())
                     
-                    return TaskContext(
+                    context = TaskContext(
                         query=query,
                         intent=analysis_data.get('intent', 'general'),
                         user_goal=analysis_data.get('user_goal', 'information'),
@@ -254,6 +260,8 @@ class AdvancedIntentAnalyzer:
                         },
                         timestamp=CURRENT_DATE
                     )
+
+                    return self._augment_context_with_focus(context, analysis_data)
         
         except Exception as e:
             logger.warning(f"LLM анализ не удался, используем базовый: {e}")
@@ -263,7 +271,7 @@ class AdvancedIntentAnalyzer:
 
     def _basic_analysis(self, query: str) -> TaskContext:
         """Базовый анализ намерений (fallback без эвристик)."""
-        return TaskContext(
+        context = TaskContext(
             query=query,
             intent="general",
             requires_search=False,
@@ -276,6 +284,171 @@ class AdvancedIntentAnalyzer:
             timestamp=CURRENT_DATE,
             meta_analysis={'llm_analysis': False}
         )
+
+        return self._augment_context_with_focus(context)
+
+    def _augment_context_with_focus(
+        self,
+        context: TaskContext,
+        analysis_data: Optional[Dict[str, Any]] = None
+    ) -> TaskContext:
+        """Дополняет контекст задач фокусом на намерениях пользователя."""
+
+        try:
+            focus_info = self._derive_focus_from_query(context.query, context, analysis_data)
+        except Exception as focus_error:  # noqa: F841
+            focus_info = {}
+
+        context.primary_objective = focus_info.get('primary_objective') or context.intent or context.query
+        context.focus_points = focus_info.get('focus_points', [])
+        context.output_expectations = focus_info.get('output_expectations', [])
+        context.verification_checks = focus_info.get('verification_checks', [])
+        context.prohibited_actions = focus_info.get('prohibited_actions', [])
+        context.focus_summary = focus_info.get('summary', '')
+
+        # Сохраняем данные в метаанализе для дальнейшего использования
+        context.meta_analysis.setdefault('focus_points', context.focus_points)
+        context.meta_analysis.setdefault('output_expectations', context.output_expectations)
+        context.meta_analysis.setdefault('verification_checks', context.verification_checks)
+        context.meta_analysis.setdefault('prohibited_actions', context.prohibited_actions)
+        if context.focus_summary:
+            context.meta_analysis.setdefault('focus_summary', context.focus_summary)
+
+        # Объединяем критерии успеха
+        base_success = context.meta_analysis.get('success_criteria', []) or []
+        focus_success = focus_info.get('success_criteria', []) or []
+        combined_success: List[str] = []
+        for criterion in base_success + focus_success:
+            if criterion and criterion not in combined_success:
+                combined_success.append(criterion)
+        if combined_success:
+            context.meta_analysis['success_criteria'] = combined_success
+
+        return context
+
+    def _derive_focus_from_query(
+        self,
+        query: str,
+        context: Optional[TaskContext] = None,
+        analysis_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Извлекает критические требования и ограничения из пользовательского запроса."""
+
+        normalized = re.sub(r"\s+", " ", query.lower()).strip()
+
+        def add_unique(target: List[str], value: str) -> None:
+            if value and value not in target:
+                target.append(value)
+
+        focus_points: List[str] = []
+        output_expectations: List[str] = []
+        verification_checks: List[str] = []
+        prohibited_actions: List[str] = [
+            "Не выдумывать данные без подтверждения официальными источниками",
+            "Не завершать задачу без проверки ключевых критериев пользователя"
+        ]
+        success_criteria: List[str] = []
+
+        # Попытка определить ключевую метрику
+        metric_description = ""
+        if any(keyword in normalized for keyword in ["ключев", "ставк"]):
+            metric_description = "значение ключевой ставки Банка России"
+            add_unique(focus_points, "Найти официальное значение ключевой ставки Банка России")
+            add_unique(success_criteria, "Получено значение ключевой ставки из надежного источника")
+
+        # Обработка временных ограничений
+        quarter_phrase = ""
+        quarter_match = re.search(r"(начал[еаи]|конец|середин[аеы])?\s*(\d)[-\s]*квартал[а-я]*\s+(\d{4})", normalized)
+        if quarter_match:
+            position = (quarter_match.group(1) or "").strip()
+            quarter_number = quarter_match.group(2)
+            year = quarter_match.group(3)
+            quarter_phrase = f"{position + ' ' if position else ''}{quarter_number}-го квартала {year} года".strip()
+
+        if not quarter_phrase:
+            quarter_words_match = re.search(
+                r"(начал[еаи]|конец|середин[аеы])?\s*(перв|втор|трет|четверт)[^\s]*\s+квартал[а-я]*\s+(\d{4})",
+                normalized
+            )
+            if quarter_words_match:
+                position = (quarter_words_match.group(1) or "").strip()
+                quarter_word = quarter_words_match.group(2)
+                year = quarter_words_match.group(3)
+                mapping = {
+                    'перв': '1',
+                    'втор': '2',
+                    'трет': '3',
+                    'четверт': '4'
+                }
+                quarter_number = mapping.get(quarter_word[:5], mapping.get(quarter_word[:4], ""))
+                if not quarter_number:
+                    quarter_number = mapping.get(quarter_word[:3], "")
+                if quarter_number:
+                    quarter_phrase = f"{position + ' ' if position else ''}{quarter_number}-го квартала {year} года".strip()
+
+        if quarter_phrase:
+            add_unique(focus_points, f"Убедиться, что данные относятся к {quarter_phrase}")
+            add_unique(verification_checks, f"Проверить дату значения ключевой ставки на {quarter_phrase}")
+            add_unique(success_criteria, f"Указан период: {quarter_phrase}")
+
+        # Требование использования официального источника
+        if any(keyword in normalized for keyword in ["цб", "cbr", "центральн", "офици", "сайт"]):
+            add_unique(focus_points, "Открыть официальный сайт Банка России (cbr.ru)")
+            add_unique(verification_checks, "Сохранить ссылку на страницу Банка России в результатах")
+            add_unique(prohibited_actions, "Не опираться на сторонние сайты без верификации на cbr.ru")
+
+        # Требования к сохранению
+        if any(keyword in normalized for keyword in ["excel", "xlsx", "эксель", "таблиц", "сохрани", "сохранить"]):
+            add_unique(output_expectations, "Сохранить найденное значение в файл формата Excel (.xlsx)")
+            add_unique(success_criteria, "Создан и приложен Excel-файл с результатом")
+
+        # Проверка на необходимость вычислений или дополнительной обработки
+        if context and (context.requires_computation or context.user_goal in {"analysis", "export"}):
+            add_unique(focus_points, "При необходимости выполнить вычисления или экспорт данных")
+
+        # Общие проверки на точность
+        add_unique(verification_checks, "Перепроверить значения перед финальным ответом")
+
+        # Определяем основную цель
+        primary_objective = ""
+        if metric_description:
+            primary_objective = f"Найти {metric_description}"
+            if quarter_phrase:
+                primary_objective += f" на {quarter_phrase}"
+            if output_expectations:
+                primary_objective += " и подготовить итоговый Excel-файл"
+        elif analysis_data and analysis_data.get('intent') not in (None, '', 'general'):
+            primary_objective = analysis_data.get('intent', '').strip()
+
+        if not primary_objective:
+            primary_objective = query.strip()
+
+        # Подготавливаем сводку
+        summary_parts: List[str] = []
+        summary_parts.append(f"Цель: {primary_objective}")
+        if focus_points:
+            summary_parts.append("Ключевые действия: " + "; ".join(focus_points[:3]))
+        if verification_checks:
+            summary_parts.append("Проверки: " + "; ".join(verification_checks[:2]))
+        if output_expectations:
+            summary_parts.append("Итог: " + "; ".join(output_expectations))
+
+        summary = ". ".join(summary_parts)
+
+        # Объединяем критерии успеха с анализом модели
+        if analysis_data and isinstance(analysis_data.get('success_criteria'), list):
+            for item in analysis_data.get('success_criteria'):
+                add_unique(success_criteria, item)
+
+        return {
+            'primary_objective': primary_objective,
+            'focus_points': focus_points,
+            'output_expectations': output_expectations,
+            'verification_checks': verification_checks,
+            'prohibited_actions': prohibited_actions,
+            'success_criteria': success_criteria,
+            'summary': summary
+        }
 
 
 class AdvancedTaskPlanner:
@@ -3092,7 +3265,7 @@ class SmartAgent:
         """Нужно ли настоятельно требовать вызова инструментов вместо текстового ответа."""
         return self._task_requires_active_tools(context) and self._has_pending_plan_steps(plan)
 
-    def _build_tool_usage_reminder(self, plan: ExecutionPlan, attempt: int) -> str:
+    def _build_tool_usage_reminder(self, context: TaskContext, plan: ExecutionPlan, attempt: int) -> str:
         """Формирует напоминание модели о необходимости вызвать инструменты."""
         pending_tools = [
             step.get('tool', 'неизвестный инструмент')
@@ -3105,12 +3278,51 @@ class SmartAgent:
 
         tools_preview = ", ".join(pending_tools[:5]) if pending_tools else "запланированные инструменты"
 
+        focus_clauses: List[str] = []
+        if context.focus_points:
+            focus_clauses.append("ключевые шаги: " + "; ".join(context.focus_points[:2]))
+        if context.verification_checks:
+            focus_clauses.append("проверки: " + "; ".join(context.verification_checks[:2]))
+        if context.output_expectations:
+            focus_clauses.append("итог: " + "; ".join(context.output_expectations[:1]))
+
+        focus_hint = ""
+        if focus_clauses:
+            focus_hint = " Помни про " + " | ".join(focus_clauses) + "."
+
         reminder = (
             f"⚠️ Попытка №{attempt}: Нельзя ограничиваться описанием шагов. "
             f"Выполни реальные вызовы функций согласно плану ({tools_preview}) и предоставь результаты каждого инструмента. "
-            "Не завершай задачу до фактического выполнения всех необходимых инструментов и вызова finish_task только по завершении."
+            "Не завершай задачу до фактического выполнения всех необходимых инструментов и вызова finish_task только по завершении." +
+            focus_hint
         )
         return reminder
+
+    def _build_focus_guardrail(self, context: TaskContext, reason: Optional[str] = None) -> str:
+        """Создает системное напоминание о фокусе на намерениях пользователя."""
+
+        lines: List[str] = ["🔁 Фокус на намерениях пользователя."]
+        if reason:
+            lines[0] += f" Причина: {reason}."
+
+        if context.primary_objective:
+            lines.append(f"Цель: {context.primary_objective}.")
+
+        if context.focus_points:
+            lines.append("Ключевые действия: " + "; ".join(context.focus_points[:2]) + ".")
+
+        if context.verification_checks:
+            lines.append("Проверки: " + "; ".join(context.verification_checks[:2]) + ".")
+
+        if context.output_expectations:
+            lines.append("Итог: " + "; ".join(context.output_expectations[:1]) + ".")
+
+        if context.prohibited_actions:
+            lines.append("Запреты: " + "; ".join(context.prohibited_actions[:1]) + ".")
+
+        lines.append("Всегда подтверждай данные ссылками на официальный источник и избегай догадок.")
+
+        return "\n".join(lines)
 
     def _format_plan_steps(self, steps):
         """Форматирует шаги плана в читаемый вид."""
@@ -3139,10 +3351,46 @@ class SmartAgent:
 - Рабочая директория: {self.file_system.base_dir}
 - Всегда придерживаюсь последовательности ls → read_file перед write_file или edit_file
 - Храню заметки и журналы задач в каталоге metacognition/ для устойчивой метапамяти"""
-        
+
         # Исправляем строку с форматированием
         plan_steps_formatted = '\n'.join([f'{i}. {step.get("description", step["tool"])} (приоритет: {step.get("priority", "не указан")})' for i, step in enumerate(plan.steps, 1)])
-        
+
+        focus_lines: List[str] = []
+
+        if context.primary_objective:
+            focus_lines.append(f"🎯 Главная цель: {context.primary_objective}")
+
+        if context.focus_summary and context.focus_summary not in focus_lines:
+            focus_lines.append(f"🧭 Обзор: {context.focus_summary}")
+
+        if context.focus_points:
+            focus_points_preview = context.focus_points[:5]
+            focus_lines.append(
+                "🔑 Ключевые действия:\n  - " + "\n  - ".join(focus_points_preview)
+            )
+
+        if context.verification_checks:
+            verification_preview = context.verification_checks[:3]
+            focus_lines.append(
+                "✅ Обязательные проверки:\n  - " + "\n  - ".join(verification_preview)
+            )
+
+        if context.output_expectations:
+            output_preview = context.output_expectations[:3]
+            focus_lines.append(
+                "📦 Итоговые артефакты:\n  - " + "\n  - ".join(output_preview)
+            )
+
+        if context.prohibited_actions:
+            prohibited_preview = context.prohibited_actions[:3]
+            focus_lines.append(
+                "⛔ Запреты:\n  - " + "\n  - ".join(prohibited_preview)
+            )
+
+        focus_section = ""
+        if focus_lines:
+            focus_section = "МОЙ ФОКУС НА НАМЕРЕНИЯХ:\n" + "\n".join(focus_lines)
+
         return f"""Я - продвинутый интеллектуальный агент X-Master v77 Enhanced. Моя роль - эффективно решать задачи пользователей, используя доступные инструменты и глубокий анализ.
 
 МОЯ ТЕКУЩАЯ СИТУАЦИЯ:
@@ -3156,6 +3404,8 @@ class SmartAgent:
 🕐 Временной контекст: {context.temporal_context}
 
 {tools_status}
+
+{focus_section if focus_section else ''}
 
 {file_system_guidelines}
 
@@ -3261,6 +3511,8 @@ class SmartAgent:
         execution_log = []
         final_answer = None
         lazy_response_attempts = 0
+        focus_reinforcements = 0
+        max_focus_reinforcements = 3
 
         iteration_limit = max(max_iterations, len(plan.steps) * 2 if plan.steps else max_iterations)
         if iteration_limit != max_iterations:
@@ -3317,6 +3569,26 @@ class SmartAgent:
                         plan.progress_notes.append(f"Planning Tool обновлен после вызова {func_name}")
                         if len(plan.progress_notes) > 10:
                             plan.progress_notes = plan.progress_notes[-10:]
+
+                    guardrail_reason: Optional[str] = None
+                    if not progress_info.get('planned', False):
+                        guardrail_reason = 'внеплановый вызов инструмента'
+                    elif not result.success:
+                        guardrail_reason = 'ошибка инструмента'
+
+                    if guardrail_reason and focus_reinforcements < max_focus_reinforcements:
+                        guardrail_message = self._build_focus_guardrail(context, guardrail_reason)
+                        messages.append({"role": "system", "content": guardrail_message})
+                        focus_reinforcements += 1
+                        logger.warning(
+                            "Активировано напоминание о фокусе (причина: %s, итого: %s)",
+                            guardrail_reason,
+                            focus_reinforcements
+                        )
+                        plan.progress_notes.append(f"Фокус-намерение усилено: {guardrail_reason}")
+                        if len(plan.progress_notes) > 10:
+                            plan.progress_notes = plan.progress_notes[-10:]
+
                     plan_progress_payload = self._build_plan_progress_payload(plan)
 
                     execution_log.append({
@@ -3378,7 +3650,7 @@ class SmartAgent:
 
                     if self._should_force_tool_usage(context, plan) and not final_answer:
                         lazy_response_attempts += 1
-                        reminder_message = self._build_tool_usage_reminder(plan, lazy_response_attempts)
+                        reminder_message = self._build_tool_usage_reminder(context, plan, lazy_response_attempts)
                         logger.warning(
                             "Модель попыталась завершить задачу без инструментов (попытка %s). Отправлено напоминание.",
                             lazy_response_attempts
@@ -3513,7 +3785,8 @@ class SmartAgent:
             'plan_progress': plan_progress_payload,
             'planning_tool_state': self.planning_tool.get_state(),
             'planning_tool_auto_started': planning_tool_auto_started,
-            'planning_tool_used': self.planning_tool.active
+            'planning_tool_used': self.planning_tool.active,
+            'focus_reinforcements': focus_reinforcements
         }
         self.metacognition.finalize(final_answer, final_summary_payload)
 
@@ -3542,7 +3815,8 @@ class SmartAgent:
             'iteration_limit': iteration_limit,
             'planning_tool_state': self.planning_tool.get_state(),
             'planning_tool_auto_started': planning_tool_auto_started,
-            'planning_tool_used': self.planning_tool.active
+            'planning_tool_used': self.planning_tool.active,
+            'focus_reinforcements_used': focus_reinforcements
         }
 
 
@@ -3753,11 +4027,27 @@ def main():
                 
                 for key, value in analysis_info.items():
                     st.text(f"{key}: {value}")
-                
+
                 if result.get('analysis_reasoning'):
                     st.markdown("**💭 Обоснование анализа:**")
                     st.text_area("", result['analysis_reasoning'], height=100, disabled=True)
-            
+
+                if (
+                    context.focus_summary
+                    or context.focus_points
+                    or context.output_expectations
+                    or context.verification_checks
+                ):
+                    st.markdown("**🔎 Фокус намерений и критерии:**")
+                    if context.focus_summary:
+                        st.info(context.focus_summary)
+                    if context.focus_points:
+                        st.markdown("- " + "\n- ".join(context.focus_points[:5]))
+                    if context.verification_checks:
+                        st.caption("Проверки: " + "; ".join(context.verification_checks[:3]))
+                    if context.output_expectations:
+                        st.caption("Итоговые артефакты: " + "; ".join(context.output_expectations[:3]))
+
             with col2:
                 st.markdown("**📋 Умное планирование задачи:**")
                 plan = result['plan']
