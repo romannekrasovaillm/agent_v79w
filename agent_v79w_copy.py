@@ -1740,7 +1740,7 @@ class FileSystemTools:
             else:
                 numbered = []
                 for idx, line in enumerate(sliced_lines, start=start + 1):
-                    stripped_line = line.rstrip('\n')
+                    stripped_line = line.rstrip("\n")
                     numbered.append(f"{idx:>6}⟶{stripped_line}")
                 content = "\n".join(numbered)
 
