@@ -132,7 +132,17 @@ class ExecutionPlan:
     current_step_index: int = 0
     completed_steps: int = 0
     progress_notes: List[str] = field(default_factory=list)
-    
+
+
+@dataclass
+class TodoItem:
+    """Представляет задачу для Planning Tool."""
+    content: str
+    status: str = "pending"
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"content": self.content, "status": self.status}
+
 
 @dataclass
 class ToolResult:
@@ -2243,6 +2253,236 @@ class MetacognitionManager:
             logger.warning(f"Не удалось сохранить финальную информацию: {e}")
 
 
+class PlanningToolManager:
+    """Интеграция с Planning Tool (write_todos) для управления сложными задачами."""
+
+    VALID_STATUSES: Set[str] = {"pending", "in_progress", "completed"}
+
+    def __init__(self, metacognition: Optional[MetacognitionManager] = None):
+        self.metacognition = metacognition
+        self.reset()
+
+    def reset(self) -> None:
+        """Сбрасывает состояние планировщика."""
+        self.todos: List[TodoItem] = []
+        self.active: bool = False
+        self.last_state_hash: Optional[str] = None
+        self.last_updated_at: Optional[str] = None
+
+    def should_activate(self, context: TaskContext, plan: ExecutionPlan) -> bool:
+        """Определяет, нужно ли автоматически включать Planning Tool."""
+        if not plan or not getattr(plan, "steps", None):
+            return False
+
+        step_count = len(plan.steps)
+        complexity = (context.complexity or "simple").lower() if context else "simple"
+        requires_multitool = any([
+            step_count >= 3,
+            complexity in {"medium", "complex"},
+            context.requires_browser if context else False,
+            context.requires_search if context else False,
+            context.requires_computation if context else False,
+            context.requires_terminal if context else False,
+            context.user_goal in {"analysis", "action", "export"} if context else False
+        ])
+
+        return requires_multitool
+
+    def initialize_from_plan(self, plan: ExecutionPlan) -> List[Dict[str, str]]:
+        """Создает todo-список на основе плана выполнения."""
+        self.todos = []
+
+        if not plan or not getattr(plan, "steps", None):
+            self.reset()
+            return []
+
+        for idx, step in enumerate(plan.steps, 1):
+            description = step.get("description") or step.get("expected_outcome") or step.get("tool", "Шаг")
+            content = f"Шаг {idx}: {description}".strip()
+            self.todos.append(TodoItem(content=content, status="pending"))
+
+        if self.todos:
+            self.todos[0].status = "in_progress"
+
+        self.active = bool(self.todos)
+        self._record_state_change()
+        return self.to_dicts()
+
+    def _serialize_state(self) -> str:
+        return json.dumps([todo.to_dict() for todo in self.todos], ensure_ascii=False, sort_keys=True)
+
+    def _record_state_change(self) -> None:
+        self.last_state_hash = self._serialize_state() if self.todos else None
+        self.last_updated_at = datetime.now().isoformat()
+
+    def _enforce_progress_rules(self) -> bool:
+        """Поддерживает корректные статусы задач согласно правилам инструмента."""
+        changed = False
+
+        for todo in self.todos:
+            if todo.status not in self.VALID_STATUSES:
+                todo.status = "pending"
+                changed = True
+
+        if not self.todos:
+            return changed
+
+        has_active = any(todo.status == "in_progress" for todo in self.todos if todo.status != "completed")
+        if not has_active:
+            for todo in self.todos:
+                if todo.status == "pending":
+                    todo.status = "in_progress"
+                    changed = True
+                    break
+
+        return changed
+
+    def to_dicts(self) -> List[Dict[str, str]]:
+        return [todo.to_dict() for todo in self.todos]
+
+    def get_state(self) -> Dict[str, Any]:
+        """Возвращает текущее состояние Planning Tool."""
+        return {
+            "active": self.active,
+            "todos": self.to_dicts(),
+            "last_updated_at": self.last_updated_at
+        }
+
+    def handle_write_todos(self, todos_payload: Any) -> ToolResult:
+        """Обрабатывает вызов функции write_todos."""
+        start_time = time.time()
+
+        if todos_payload is None:
+            todos_payload = []
+
+        if not isinstance(todos_payload, list):
+            return ToolResult(
+                tool_name="write_todos",
+                success=False,
+                data={"errors": ["Параметр 'todos' должен быть списком"]},
+                error="Некорректный формат параметров",
+                execution_time=time.time() - start_time,
+                confidence=0.0
+            )
+
+        normalized: List[TodoItem] = []
+        errors: List[str] = []
+
+        for index, item in enumerate(todos_payload, 1):
+            if not isinstance(item, dict):
+                errors.append(f"Элемент #{index} не является объектом")
+                continue
+
+            content = str(item.get("content", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+
+            if not content:
+                errors.append(f"Элемент #{index} содержит пустое описание")
+                continue
+
+            if status not in self.VALID_STATUSES:
+                errors.append(f"Элемент #{index} имеет недопустимый статус '{status}'")
+                status = "pending"
+
+            normalized.append(TodoItem(content=content, status=status))
+
+        if not normalized:
+            return ToolResult(
+                tool_name="write_todos",
+                success=False,
+                data={"errors": errors or ["Не удалось сформировать список задач"]},
+                error="Список задач пуст или некорректен",
+                execution_time=time.time() - start_time,
+                confidence=0.0
+            )
+
+        self.todos = normalized
+        self.active = True
+        auto_adjusted = self._enforce_progress_rules()
+        self._record_state_change()
+
+        metadata = {
+            "count": len(self.todos),
+            "active": self.active,
+            "auto_adjusted": auto_adjusted,
+        }
+        if errors:
+            metadata["warnings"] = errors
+
+        result_data = {
+            "todos": self.to_dicts(),
+            "active": self.active,
+            "last_updated_at": self.last_updated_at
+        }
+
+        return ToolResult(
+            tool_name="write_todos",
+            success=True,
+            data=result_data,
+            metadata=metadata,
+            error=None,
+            execution_time=time.time() - start_time,
+            confidence=1.0 if self.active else 0.8
+        )
+
+    def sync_with_plan(self, plan: ExecutionPlan) -> bool:
+        """Синхронизирует статусы todo со статусами шагов плана."""
+        if not self.active or not self.todos or not plan or not getattr(plan, "steps", None):
+            return False
+
+        changed = False
+
+        for step in plan.steps:
+            order = step.get("order")
+            if order is None or order >= len(self.todos):
+                continue
+
+            plan_status = step.get("status")
+
+            if plan_status in {"completed", "skipped"}:
+                desired_status = "completed"
+            elif plan_status == "in_progress":
+                desired_status = "in_progress"
+            else:
+                desired_status = "pending"
+
+            if self.todos[order].status != desired_status:
+                self.todos[order].status = desired_status
+                changed = True
+
+        if self._enforce_progress_rules():
+            changed = True
+
+        serialized_state = self._serialize_state()
+        if serialized_state != self.last_state_hash:
+            changed = True
+
+        if changed:
+            self.last_state_hash = serialized_state
+            self.last_updated_at = datetime.now().isoformat()
+
+        return changed
+
+    def complete_all(self) -> bool:
+        """Помечает все задачи завершенными."""
+        if not self.active or not self.todos:
+            return False
+
+        changed = False
+        for todo in self.todos:
+            if todo.status != "completed":
+                todo.status = "completed"
+                changed = True
+
+        if changed:
+            self._record_state_change()
+
+        return changed
+
+    def has_pending_tasks(self) -> bool:
+        return any(todo.status != "completed" for todo in self.todos)
+
+
 class SmartAgent:
     """Умный агент для решения задач пользователя с улучшенным анализом и планированием."""
 
@@ -2258,6 +2498,7 @@ class SmartAgent:
         self.code_executor = CodeExecutor()
         self.file_system = FileSystemTools()
         self.metacognition = MetacognitionManager(self.file_system)
+        self.planning_tool = PlanningToolManager(self.metacognition)
 
         # Контроль попыток ленивого ответа без вызова инструментов
         self.lazy_response_limit = 3
@@ -2491,6 +2732,36 @@ class SmartAgent:
         ])
 
         functions.append({
+            "name": "write_todos",
+            "description": "Обновляет todo-список (Planning Tool) для сложных задач. Передавай полный актуальный список задач со статусами.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "Список задач, который нужно зафиксировать",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Описание задачи"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Статус задачи"
+                                }
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }
+        })
+
+        functions.append({
             "name": "finish_task",
             "description": "Завершает выполнение задачи с финальным ответом",
             "parameters": {
@@ -2510,6 +2781,8 @@ class SmartAgent:
     def execute_function(self, function_name: str, arguments: Dict) -> ToolResult:
         """Выполняет функцию."""
         try:
+            arguments = arguments or {}
+
             if function_name == "web_search":
                 return self.web_search.search(
                     query=arguments.get("query"),
@@ -2570,6 +2843,9 @@ class SmartAgent:
                     new_string=arguments.get("new_string", ""),
                     replace_all=arguments.get("replace_all", False)
                 )
+
+            elif function_name == "write_todos":
+                return self.planning_tool.handle_write_todos(arguments.get("todos"))
 
             elif function_name == "finish_task":
                 return ToolResult(
@@ -2770,6 +3046,12 @@ class SmartAgent:
 
         next_step = pending_steps[0] if pending_steps else None
 
+        planning_state = self.planning_tool.get_state() if hasattr(self, "planning_tool") and self.planning_tool else {
+            "active": False,
+            "todos": [],
+            "last_updated_at": None
+        }
+
         return {
             'total_steps': progress.get('total_steps', len(plan.steps)),
             'completed_steps': progress.get('completed', plan.completed_steps),
@@ -2779,7 +3061,8 @@ class SmartAgent:
             'next_step': next_step,
             'pending_steps': pending_steps[:5],
             'recent_history': progress.get('history', [])[-5:],
-            'recent_notes': plan.progress_notes[-5:] if plan.progress_notes else []
+            'recent_notes': plan.progress_notes[-5:] if plan.progress_notes else [],
+            'planning_tool': planning_state
         }
 
     def _has_pending_plan_steps(self, plan: ExecutionPlan) -> bool:
@@ -2882,9 +3165,16 @@ class SmartAgent:
 Конкретные шаги:
 {plan_steps_formatted}
 
-Критерии успеха: {', '.join(plan.success_criteria) if plan.success_criteria else 'Полный и точный ответ пользователю'}
+  Критерии успеха: {', '.join(plan.success_criteria) if plan.success_criteria else 'Полный и точный ответ пользователю'}
 
-МОИ ПРИНЦИПЫ РАБОТЫ:
+  МОЙ ПЛАНИРОВЩИК ЗАДАЧ (PLANNING TOOL):
+  - Для сложных или многошаговых задач и по запросу пользователя я веду todo-список через write_todos
+  - Первую актуальную задачу отмечаю in_progress, остальные pending и обновляю статусы сразу после прогресса
+  - Поддерживаю только статусы pending/in_progress/completed и не допускаю отсутствия активной задачи
+  - При изменении плана адаптирую список: удаляю лишние пункты, добавляю новые и фиксирую фактический прогресс
+  - Todo-список показывает пользователю мой ход работы, поэтому обновляю его оперативно
+
+  МОИ ПРИНЦИПЫ РАБОТЫ:
 1. Я всегда начинаю с глубокого анализа поставленной задачи
 2. Я использую инструменты последовательно и обдуманно
 3. Я проверяю результаты каждого шага перед переходом к следующему
@@ -2920,11 +3210,15 @@ class SmartAgent:
         """Обрабатывает запрос пользователя с улучшенным анализом."""
         logger.info(f"Начинаю обработку запроса: {query}")
         logger.info(f"Текущая дата для контекста: {CURRENT_DATE_FORMATTED}")
-        
+
+        # Сбрасываем состояние Planning Tool для новой задачи
+        if hasattr(self, "planning_tool") and self.planning_tool:
+            self.planning_tool.reset()
+
         # Глубокий анализ намерений с помощью LLM
         context = self.intent_analyzer.analyze_with_llm(query)
         logger.info(f"Результат анализа намерений: {context}")
-        
+
         # Создаем умный план выполнения
         plan = self.task_planner.create_smart_plan(context)
         logger.info(f"Создан план: {[step['tool'] for step in plan.steps]}")
@@ -2932,6 +3226,23 @@ class SmartAgent:
 
         # Подготавливаем план к отслеживанию длительных цепочек
         self._initialize_plan_tracking(plan)
+
+        planning_tool_auto_started = False
+        if hasattr(self, "planning_tool") and self.planning_tool.should_activate(context, plan):
+            initial_todos = self.planning_tool.initialize_from_plan(plan)
+            if initial_todos:
+                planning_tool_auto_started = True
+                logger.info(
+                    "Planning Tool активирован автоматически: сформировано %s задач",
+                    len(initial_todos)
+                )
+                plan.progress_notes.append("Активирован Planning Tool: сформирован todo-список по плану")
+                if len(plan.progress_notes) > 10:
+                    plan.progress_notes = plan.progress_notes[-10:]
+            else:
+                logger.debug("Planning Tool не активирован: автоматическая инициализация не создала задач")
+        else:
+            logger.debug("Planning Tool не требует активации для данной задачи")
 
         # Запускаем файловую метапамять
         session_dir = self.metacognition.start_session(query, context, plan)
@@ -3001,6 +3312,11 @@ class SmartAgent:
                     result = self.execute_function(func_name, func_args)
                     lazy_response_attempts = 0
                     progress_info = self._update_plan_progress(plan, func_name, result)
+                    planning_tool_changed = self.planning_tool.sync_with_plan(plan)
+                    if planning_tool_changed:
+                        plan.progress_notes.append(f"Planning Tool обновлен после вызова {func_name}")
+                        if len(plan.progress_notes) > 10:
+                            plan.progress_notes = plan.progress_notes[-10:]
                     plan_progress_payload = self._build_plan_progress_payload(plan)
 
                     execution_log.append({
@@ -3101,6 +3417,12 @@ class SmartAgent:
                         # Принудительно вызываем finish_task
                         result = self.execute_function("finish_task", {"answer": content})
                         lazy_response_attempts = 0
+                        progress_info = self._update_plan_progress(plan, "finish_task", result)
+                        planning_tool_changed = self.planning_tool.sync_with_plan(plan)
+                        if planning_tool_changed:
+                            plan.progress_notes.append("Planning Tool обновлен после вызова finish_task")
+                            if len(plan.progress_notes) > 10:
+                                plan.progress_notes = plan.progress_notes[-10:]
                         plan_progress_payload = self._build_plan_progress_payload(plan)
                         execution_log.append({
                             'function': 'finish_task',
@@ -3108,10 +3430,10 @@ class SmartAgent:
                             'result': result,
                             'iteration': iteration + 1,
                             'timestamp': datetime.now().isoformat(),
-                            'planned': True,
-                            'plan_status': 'completion',
-                            'plan_note': 'Завершение задачи финальным ответом',
-                            'plan_summary': 'finish_task',
+                            'planned': progress_info.get('planned', True),
+                            'plan_status': progress_info.get('status', 'completion'),
+                            'plan_note': progress_info.get('note') or 'Завершение задачи финальным ответом',
+                            'plan_summary': progress_info.get('summary') or 'finish_task',
                             'plan_state': {
                                 'completed_steps': plan_progress_payload.get('completed_steps'),
                                 'pending_steps': len(plan_progress_payload.get('pending_steps', [])),
@@ -3123,7 +3445,7 @@ class SmartAgent:
                             arguments={"answer": content},
                             result=result,
                             plan_progress=plan_progress_payload,
-                            note='Завершение задачи финальным ответом'
+                            note=progress_info.get('note') or 'Завершение задачи финальным ответом'
                         )
                         plan.progress_notes.append('Задача закрыта вызовом finish_task')
                         if len(plan.progress_notes) > 10:
@@ -3141,7 +3463,12 @@ class SmartAgent:
                 self.browser.close_session()
         except:
             pass
-        
+
+        # Финально синхронизируем Planning Tool
+        self.planning_tool.sync_with_plan(plan)
+        if final_answer and not self._has_pending_plan_steps(plan):
+            self.planning_tool.complete_all()
+
         # Анализируем выполнение
         successful_tools = sum(1 for log in execution_log if log['result'].success)
         total_tools = len(execution_log)
@@ -3183,7 +3510,10 @@ class SmartAgent:
             'plan_completion_percent': plan_completion_percent,
             'plan_adherence_percent': plan_adherence_percent,
             'iterations_used': iterations_used,
-            'plan_progress': plan_progress_payload
+            'plan_progress': plan_progress_payload,
+            'planning_tool_state': self.planning_tool.get_state(),
+            'planning_tool_auto_started': planning_tool_auto_started,
+            'planning_tool_used': self.planning_tool.active
         }
         self.metacognition.finalize(final_answer, final_summary_payload)
 
@@ -3209,7 +3539,10 @@ class SmartAgent:
             'plan_reasoning': plan.reasoning,
             'quality_score': quality_score,
             'risk_assessment': plan.risk_assessment,
-            'iteration_limit': iteration_limit
+            'iteration_limit': iteration_limit,
+            'planning_tool_state': self.planning_tool.get_state(),
+            'planning_tool_auto_started': planning_tool_auto_started,
+            'planning_tool_used': self.planning_tool.active
         }
 
 
@@ -3434,13 +3767,47 @@ def main():
                     "Уверенность в плане": f"{plan.confidence:.1%}",
                     "Уровень адаптивности": plan.adaptability_level
                 }
-                
+
                 for key, value in plan_info.items():
                     st.text(f"{key}: {value}")
-                
+
                 if plan.reasoning:
                     st.markdown("**🎯 Логика планирования:**")
                     st.text_area("", plan.reasoning, height=100, disabled=True, key="plan_reasoning")
+
+            # Planning Tool overview
+            st.markdown("---")
+            st.subheader("🗒️ Planning Tool — список задач")
+            planning_state = result.get('planning_tool_state') or {}
+
+            if planning_state.get('active') and planning_state.get('todos'):
+                status_mapping = {
+                    "pending": ("⏳", "Ожидает начала"),
+                    "in_progress": ("🔄", "В работе"),
+                    "completed": ("✅", "Завершено")
+                }
+
+                for idx, todo in enumerate(planning_state.get('todos', []), 1):
+                    status = todo.get('status', 'pending')
+                    emoji, label = status_mapping.get(status, ("•", status))
+                    content = todo.get('content', f"Задача {idx}")
+                    st.markdown(f"{emoji} **{idx}. {content}** — {label}")
+
+                meta_notes = []
+                if planning_state.get('last_updated_at'):
+                    meta_notes.append(f"Обновлено: {planning_state['last_updated_at']}")
+                if result.get('planning_tool_auto_started') is not None:
+                    auto_flag = "Да" if result.get('planning_tool_auto_started') else "Нет"
+                    meta_notes.append(f"Автоактивация: {auto_flag}")
+                if not result.get('planning_tool_used', False):
+                    meta_notes.append("Статус: не используется")
+                elif not meta_notes:
+                    meta_notes.append("Статус: активен")
+
+                if meta_notes:
+                    st.caption(" | ".join(meta_notes))
+            else:
+                st.info("Planning Tool не активировался для этой задачи.")
 
             # Сравнение плана и выполнения
             if result.get('planned_tools') and result.get('executed_tools'):
