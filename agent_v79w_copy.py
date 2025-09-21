@@ -123,6 +123,13 @@ class TaskContext:
     verification_checks: List[str] = field(default_factory=list)
     prohibited_actions: List[str] = field(default_factory=list)
     focus_summary: str = ""
+    critical_sources: List[str] = field(default_factory=list)
+    source_priority: List[str] = field(default_factory=list)
+    source_validation_steps: List[str] = field(default_factory=list)
+    source_strategy: str = ""
+    recovery_considerations: List[str] = field(default_factory=list)
+    monitoring_signals: List[str] = field(default_factory=list)
+    risk_alerts: List[str] = field(default_factory=list)
     
 
 @dataclass
@@ -139,6 +146,9 @@ class ExecutionPlan:
     current_step_index: int = 0
     completed_steps: int = 0
     progress_notes: List[str] = field(default_factory=list)
+    recovery_strategy: str = ""
+    source_strategy: str = ""
+    monitoring_signals: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -196,9 +206,22 @@ class AdvancedIntentAnalyzer:
    - Нужны ли вычисления или анализ данных?
    - Потребуется ли терминал или работа с файлами?
 
-5. КРИТЕРИИ УСПЕХА:
-   - Как я пойму, что задача решена правильно?
-   - Какой формат ответа будет наиболее полезен?
+4. ИСТОЧНИКИ И ДОСТОВЕРНОСТЬ:
+   - Какие источники критичны для решения задачи?
+   - Как определить, какие источники имеют наивысший приоритет?
+   - Какие признаки помогут оценить надежность или сомнительность источника?
+
+5. ПЛАН ПРОВЕРКИ И ИЕРАРХИЯ ИСТОЧНИКОВ:
+   - Как выстроить иерархию источников по степени доверия?
+   - Какие шаги потребуются для проверки и подтверждения найденных данных?
+
+6. МОНИТОРИНГ И РИСКИ:
+   - Какие сигналы укажут, что план нужно скорректировать?
+   - Какие риски или ограничения стоит учесть заранее?
+
+7. СТРАТЕГИЯ ВОССТАНОВЛЕНИЯ:
+   - Что делать, если нужный инструмент или источник недоступны?
+   - Какие альтернативы и запасные варианты стоит подготовить?
 
 Я отвечу в формате JSON:
 {{
@@ -214,6 +237,13 @@ class AdvancedIntentAnalyzer:
     "temporal_context": "historical/current/future",
     "expected_sources": число_источников,
     "keywords": ["ключевое слово 1", "ключевое слово 2"],
+    "critical_sources": ["критический источник 1"],
+    "source_priority": ["наивысший приоритет", "резервный источник"],
+    "source_strategy": "стратегия работы с источниками",
+    "source_validation_steps": ["шаг проверки 1"],
+    "monitoring_signals": ["сигнал 1"],
+    "recovery_considerations": ["вариант восстановления 1"],
+    "risk_alerts": ["риск 1"],
     "success_criteria": ["критерий 1", "критерий 2"],
     "reasoning": "подробное объяснение анализа",
     "confidence_score": 0.0-1.0
@@ -253,6 +283,13 @@ class AdvancedIntentAnalyzer:
                         temporal_context=analysis_data.get('temporal_context', 'current'),
                         expected_sources=analysis_data.get('expected_sources', 3),
                         keywords=analysis_data.get('keywords', []),
+                        critical_sources=analysis_data.get('critical_sources', []),
+                        source_priority=analysis_data.get('source_priority', []),
+                        source_validation_steps=analysis_data.get('source_validation_steps', []),
+                        source_strategy=analysis_data.get('source_strategy', ''),
+                        recovery_considerations=analysis_data.get('recovery_considerations', []),
+                        monitoring_signals=analysis_data.get('monitoring_signals', []),
+                        risk_alerts=analysis_data.get('risk_alerts', []),
                         confidence_score=analysis_data.get('confidence_score', 0.8),
                         meta_analysis={
                             'success_criteria': analysis_data.get('success_criteria', []),
@@ -282,6 +319,9 @@ class AdvancedIntentAnalyzer:
             complexity="simple",
             domain="general",
             keywords=[],
+            source_strategy="Использовать проверенные источники и при необходимости уточнять запрос",
+            recovery_considerations=["Переформулировать запрос или сменить инструмент при ошибке"],
+            monitoring_signals=["Повторяющиеся ошибки инструментов", "Отсутствие релевантных результатов"],
             timestamp=CURRENT_DATE,
             meta_analysis={'llm_analysis': False}
         )
@@ -300,12 +340,32 @@ class AdvancedIntentAnalyzer:
         except Exception as focus_error:  # noqa: F841
             focus_info = {}
 
-        context.primary_objective = focus_info.get('primary_objective') or context.intent or context.query
-        context.focus_points = focus_info.get('focus_points', [])
-        context.output_expectations = focus_info.get('output_expectations', [])
-        context.verification_checks = focus_info.get('verification_checks', [])
-        context.prohibited_actions = focus_info.get('prohibited_actions', [])
-        context.focus_summary = focus_info.get('summary', '')
+        def merge_unique(current: List[str], new_values: Optional[List[str]]) -> List[str]:
+            merged: List[str] = list(current or [])
+            if not new_values:
+                return merged
+            for item in new_values:
+                if item and item not in merged:
+                    merged.append(item)
+            return merged
+
+        context.primary_objective = focus_info.get('primary_objective') or context.primary_objective or context.intent or context.query
+        context.focus_points = focus_info.get('focus_points', context.focus_points or [])
+        context.output_expectations = focus_info.get('output_expectations', context.output_expectations or [])
+        context.verification_checks = focus_info.get('verification_checks', context.verification_checks or [])
+        context.prohibited_actions = focus_info.get('prohibited_actions', context.prohibited_actions or [])
+        context.focus_summary = focus_info.get('summary', context.focus_summary or '')
+        context.critical_sources = merge_unique(context.critical_sources, focus_info.get('critical_sources'))
+        context.source_priority = merge_unique(context.source_priority, focus_info.get('source_priority'))
+        context.source_validation_steps = merge_unique(context.source_validation_steps, focus_info.get('source_validation_steps'))
+        context.monitoring_signals = merge_unique(context.monitoring_signals, focus_info.get('monitoring_signals'))
+        context.recovery_considerations = merge_unique(context.recovery_considerations, focus_info.get('recovery_considerations'))
+        context.risk_alerts = merge_unique(context.risk_alerts, focus_info.get('risk_alerts'))
+
+        if focus_info.get('source_strategy'):
+            context.source_strategy = focus_info.get('source_strategy', context.source_strategy)
+        elif analysis_data and not context.source_strategy:
+            context.source_strategy = analysis_data.get('source_strategy', context.source_strategy)
 
         # Сохраняем данные в метаанализе для дальнейшего использования
         context.meta_analysis.setdefault('focus_points', context.focus_points)
@@ -314,6 +374,20 @@ class AdvancedIntentAnalyzer:
         context.meta_analysis.setdefault('prohibited_actions', context.prohibited_actions)
         if context.focus_summary:
             context.meta_analysis.setdefault('focus_summary', context.focus_summary)
+        if context.critical_sources:
+            context.meta_analysis.setdefault('critical_sources', context.critical_sources)
+        if context.source_priority:
+            context.meta_analysis.setdefault('source_priority', context.source_priority)
+        if context.source_validation_steps:
+            context.meta_analysis.setdefault('source_validation_steps', context.source_validation_steps)
+        if context.source_strategy:
+            context.meta_analysis.setdefault('source_strategy', context.source_strategy)
+        if context.monitoring_signals:
+            context.meta_analysis.setdefault('monitoring_signals', context.monitoring_signals)
+        if context.recovery_considerations:
+            context.meta_analysis.setdefault('recovery_considerations', context.recovery_considerations)
+        if context.risk_alerts:
+            context.meta_analysis.setdefault('risk_alerts', context.risk_alerts)
 
         # Объединяем критерии успеха
         base_success = context.meta_analysis.get('success_criteria', []) or []
@@ -349,6 +423,12 @@ class AdvancedIntentAnalyzer:
             "Не завершать задачу без проверки ключевых критериев пользователя"
         ]
         success_criteria: List[str] = []
+        critical_sources: List[str] = list((analysis_data or {}).get('critical_sources', [])) if analysis_data else []
+        source_priority: List[str] = list((analysis_data or {}).get('source_priority', [])) if analysis_data else []
+        source_validation_steps: List[str] = list((analysis_data or {}).get('source_validation_steps', [])) if analysis_data else []
+        monitoring_signals: List[str] = list((analysis_data or {}).get('monitoring_signals', [])) if analysis_data else []
+        recovery_considerations: List[str] = list((analysis_data or {}).get('recovery_considerations', [])) if analysis_data else []
+        risk_alerts: List[str] = list((analysis_data or {}).get('risk_alerts', [])) if analysis_data else []
 
         # Попытка определить ключевую метрику
         metric_description = ""
@@ -356,6 +436,10 @@ class AdvancedIntentAnalyzer:
             metric_description = "значение ключевой ставки Банка России"
             add_unique(focus_points, "Найти официальное значение ключевой ставки Банка России")
             add_unique(success_criteria, "Получено значение ключевой ставки из надежного источника")
+            add_unique(critical_sources, "Сайт Банка России (cbr.ru) — официальный источник")
+            add_unique(source_validation_steps, "Сверить данные с официальной публикацией Банка России")
+            add_unique(source_priority, "Официальные сайты Банка России > надёжные деловые СМИ > агрегаторы")
+            add_unique(risk_alerts, "Значения ставки обновляются по решениям ЦБ — проверять актуальность даты")
 
         # Обработка временных ограничений
         quarter_phrase = ""
@@ -397,6 +481,35 @@ class AdvancedIntentAnalyzer:
             add_unique(focus_points, "Открыть официальный сайт Банка России (cbr.ru)")
             add_unique(verification_checks, "Сохранить ссылку на страницу Банка России в результатах")
             add_unique(prohibited_actions, "Не опираться на сторонние сайты без верификации на cbr.ru")
+            add_unique(critical_sources, "Официальный сайт Центрального банка (cbr.ru)")
+            add_unique(source_validation_steps, "Проверить, что данные получены напрямую с cbr.ru или официального релиза")
+            add_unique(source_priority, "Официальные органы > профильные ведомства > вторичные источники")
+
+        if any(keyword in normalized for keyword in ["аналит", "обзор", "сравн", "динамик"]):
+            add_unique(focus_points, "Сравнить данные минимум из двух независимых источников")
+            add_unique(source_validation_steps, "Зафиксировать вторую точку верификации для сверки выводов")
+            add_unique(critical_sources, "Надёжные аналитические агентства или профильные СМИ")
+
+        if not monitoring_signals:
+            monitoring_signals.extend([
+                "Отсутствие подтверждения ключевых данных в надёжных источниках",
+                "Повторяющиеся ошибки или тайм-ауты инструментов"
+            ])
+
+        if not recovery_considerations:
+            recovery_considerations.extend([
+                "Переформулировать запрос и выполнить повторный поиск",
+                "Переключиться на резервный инструмент или использовать fallback-план"
+            ])
+
+        if not risk_alerts:
+            risk_alerts.append("Полученные данные могут быстро устареть — фиксировать дату обновления")
+
+        if not source_priority and critical_sources:
+            source_priority.append("Официальные и первичные источники > авторитетные вторичные > пользовательские")
+
+        if not source_validation_steps:
+            source_validation_steps.append("Подтвердить ключевые факты минимум в двух независимых источниках")
 
         # Требования к сохранению
         if any(keyword in normalized for keyword in ["excel", "xlsx", "эксель", "таблиц", "сохрани", "сохранить"]):
@@ -433,6 +546,8 @@ class AdvancedIntentAnalyzer:
             summary_parts.append("Проверки: " + "; ".join(verification_checks[:2]))
         if output_expectations:
             summary_parts.append("Итог: " + "; ".join(output_expectations))
+        if critical_sources:
+            summary_parts.append("Источники: " + "; ".join(critical_sources[:2]))
 
         summary = ". ".join(summary_parts)
 
@@ -441,6 +556,13 @@ class AdvancedIntentAnalyzer:
             for item in analysis_data.get('success_criteria'):
                 add_unique(success_criteria, item)
 
+        source_strategy_value = (analysis_data or {}).get('source_strategy') if analysis_data else None
+        if not source_strategy_value:
+            if critical_sources:
+                source_strategy_value = "Сначала изучить официальные публикации (" + ", ".join(critical_sources[:2]) + ") и подтвердить выводы независимыми источниками"
+            else:
+                source_strategy_value = "Выстроить цепочку: официальные сайты → авторитетные аналитики → вторичные обзоры с обязательной валидацией"
+
         return {
             'primary_objective': primary_objective,
             'focus_points': focus_points,
@@ -448,7 +570,14 @@ class AdvancedIntentAnalyzer:
             'verification_checks': verification_checks,
             'prohibited_actions': prohibited_actions,
             'success_criteria': success_criteria,
-            'summary': summary
+            'summary': summary,
+            'critical_sources': critical_sources,
+            'source_priority': source_priority,
+            'source_validation_steps': source_validation_steps,
+            'monitoring_signals': monitoring_signals,
+            'recovery_considerations': recovery_considerations,
+            'risk_alerts': risk_alerts,
+            'source_strategy': source_strategy_value
         }
 
 
@@ -461,7 +590,7 @@ class AdvancedTaskPlanner:
     def create_smart_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает умный план выполнения с использованием LLM."""
         
-        planning_prompt = f"""Я - опытный планировщик задач. Мне нужно создать оптимальный план выполнения для следующей задачи:
+        planning_prompt = f"""Я - опытный планировщик задач. Мне нужно создать адаптивный и агентный план выполнения для следующей задачи:
 
 КОНТЕКСТ ЗАДАЧИ:
 - Запрос: "{context.query}"
@@ -472,6 +601,12 @@ class AdvancedTaskPlanner:
 - Срочность: {context.urgency}
 - Временной контекст: {context.temporal_context}
 - Ключевые слова: {', '.join(context.keywords)}
+- Критические источники: {', '.join(context.critical_sources) if context.critical_sources else 'нужно определить'}
+- Приоритет источников: {', '.join(context.source_priority) if context.source_priority else 'нужно сформировать'}
+- Проверка источников: {', '.join(context.source_validation_steps) if context.source_validation_steps else 'требуется спланировать'}
+- Стратегия работы с источниками: {context.source_strategy or 'нужно сформулировать'}
+- Сигналы мониторинга: {', '.join(context.monitoring_signals) if context.monitoring_signals else 'нужно задать'}
+- Варианты восстановления: {', '.join(context.recovery_considerations) if context.recovery_considerations else 'нужно подготовить'}
 
 ДОСТУПНЫЕ УНИВЕРСАЛЬНЫЕ ИНСТРУМЕНТЫ:
 1. web_search — поиск в интернете
@@ -496,13 +631,20 @@ class AdvancedTaskPlanner:
    - В каком порядке их лучше использовать?
    - Какие могут быть проблемы и как их избежать?
 
-2. СТРАТЕГИЯ ВЫПОЛНЕНИЯ:
-   - Начинать с самых надежных источников
-   - Использовать браузер для динамических сайтов
-   - Применять вычисления или терминал для анализа данных
-   - Фиксировать результаты в файлах при необходимости
+2. СТРАТЕГИЯ ИСТОЧНИКОВ:
+   - Какие источники считаются первичными и наиболее надежными?
+   - Как выстроить приоритеты использования источников?
+   - Как проверять достоверность и фиксировать ссылки?
 
-3. ОЦЕНКА РИСКОВ:
+3. ПЛАН АДАПТАЦИИ:
+   - Какие сигналы покажут, что нужно скорректировать план?
+   - Как обновлять стратегию при появлении новых данных?
+
+4. СТРАТЕГИЯ ВОССТАНОВЛЕНИЯ:
+   - Что делать при ошибке инструмента или недоступности источника?
+   - Какие альтернативные шаги подготовить заранее?
+
+5. ОЦЕНКА РИСКОВ:
    - Что может пойти не так?
    - Какие альтернативы подготовить?
 
@@ -527,7 +669,10 @@ class AdvancedTaskPlanner:
         "mitigation": "стратегии снижения рисков"
     }},
     "success_criteria": ["критерий 1", "критерий 2"],
-    "adaptability_level": "low/medium/high"
+    "adaptability_level": "low/medium/high",
+    "source_strategy": "как обращаться с источниками",
+    "monitoring_signals": ["сигнал 1"],
+    "recovery_strategy": "как восстанавливаться при сбоях"
 }}"""
 
         plan_data: Optional[Dict[str, Any]] = None
@@ -551,6 +696,14 @@ class AdvancedTaskPlanner:
                 if plan_data:
                     adapted_steps = [step.copy() for step in plan_data.get('steps', [])]
 
+                    monitoring_signals = plan_data.get('monitoring_signals', [])
+                    if isinstance(monitoring_signals, str):
+                        monitoring_signals = [monitoring_signals]
+                    elif isinstance(monitoring_signals, (set, tuple)):
+                        monitoring_signals = list(monitoring_signals)
+                    elif not isinstance(monitoring_signals, list):
+                        monitoring_signals = [str(monitoring_signals)] if monitoring_signals is not None else []
+
                     return ExecutionPlan(
                         steps=adapted_steps,
                         reasoning=plan_data.get('reasoning', ''),
@@ -559,6 +712,9 @@ class AdvancedTaskPlanner:
                         risk_assessment=plan_data.get('risk_assessment', {}),
                         success_criteria=plan_data.get('success_criteria', []),
                         adaptability_level=plan_data.get('adaptability_level', 'medium'),
+                        recovery_strategy=plan_data.get('recovery_strategy', ''),
+                        source_strategy=plan_data.get('source_strategy', ''),
+                        monitoring_signals=monitoring_signals,
                         fallback_plan=self._create_fallback_plan(context),
                         current_step_index=0,
                         completed_steps=0,
@@ -786,7 +942,14 @@ class AdvancedTaskPlanner:
             fallback_plan=self._create_fallback_plan(context),
             current_step_index=0,
             completed_steps=0,
-            progress_notes=[]
+            progress_notes=[],
+            recovery_strategy="При ошибках повторить поиск с уточнением запроса и задействовать fallback-план",
+            source_strategy="Начать с официальных источников, затем подтвердить данными из независимых источников",
+            monitoring_signals=[
+                "Ошибки инструментов или тайм-ауты",
+                "Отсутствие релевантных результатов поиска",
+                "Несогласованность данных между источниками"
+            ]
         )
 
     def _create_fallback_plan(self, context: TaskContext) -> List[Dict]:
@@ -3779,6 +3942,229 @@ class SmartAgent:
             'status': status_label if planned else 'unplanned'
         }
 
+    def _insert_plan_step(
+        self,
+        plan: ExecutionPlan,
+        index: int,
+        step_definition: Dict[str, Any],
+        note: Optional[str] = None,
+        origin: str = "auto_recovery"
+    ) -> None:
+        """Добавляет новый шаг в план с корректным пересчетом порядка."""
+        if not step_definition:
+            return
+
+        if not hasattr(plan, 'progress'):
+            self._initialize_plan_tracking(plan)
+
+        step_copy = copy.deepcopy(step_definition)
+        step_copy.setdefault('tool', step_copy.get('tool', 'web_search'))
+        step_copy.setdefault('description', step_copy.get('description', step_copy['tool']))
+        step_copy.setdefault('priority', step_copy.get('priority', 0))
+        step_copy.setdefault('parameters', step_copy.get('parameters', {}))
+        step_copy.setdefault('expected_outcome', step_copy.get('expected_outcome', 'Результат шага'))
+        step_copy['status'] = 'pending'
+        step_copy['attempts'] = 0
+        step_copy['history'] = []
+        step_copy['last_result_summary'] = None
+        step_copy['origin'] = step_copy.get('origin', origin)
+
+        insert_index = max(0, min(index, len(plan.steps)))
+        plan.steps.insert(insert_index, step_copy)
+
+        for order, step in enumerate(plan.steps):
+            step['order'] = order
+
+        if hasattr(plan, 'progress') and isinstance(plan.progress, dict):
+            plan.progress['total_steps'] = len(plan.steps)
+
+        note_text = note or f"Добавлен шаг восстановления: {step_copy['tool']} — {step_copy['description']}"
+        plan.progress_notes.append(note_text)
+        if len(plan.progress_notes) > 10:
+            plan.progress_notes = plan.progress_notes[-10:]
+
+        if hasattr(self, 'planning_tool') and self.planning_tool and self.planning_tool.active:
+            self.planning_tool.initialize_from_plan(plan)
+
+    def _build_fallback_step(self, failed_step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Создает шаг fallback на основе неудавшегося шага плана."""
+        if not failed_step:
+            return None
+
+        fallback_tool = failed_step.get('fallback')
+        if not fallback_tool:
+            return None
+
+        fallback_step = {
+            'tool': fallback_tool,
+            'description': failed_step.get(
+                'fallback_description',
+                f"Альтернатива после ошибки {failed_step.get('tool', 'инструмента')}"
+            ),
+            'priority': failed_step.get('priority', 0) + 0.1,
+            'parameters': failed_step.get('parameters', {}),
+            'expected_outcome': failed_step.get('expected_outcome', 'Получить результат через альтернативный инструмент'),
+            'origin': 'auto_recovery_fallback'
+        }
+        return fallback_step
+
+    def _build_alternative_query(self, context: TaskContext, failed_step: Optional[Dict[str, Any]] = None) -> str:
+        """Формирует уточненный поисковый запрос для восстановительных шагов."""
+        base_query = (context.query or '').strip()
+        parts: List[str] = []
+        if base_query:
+            parts.append(base_query)
+
+        domain = (context.domain or '').strip()
+        if domain and domain.lower() not in base_query.lower():
+            parts.append(domain)
+
+        for keyword in (context.keywords or [])[:3]:
+            keyword_clean = keyword.strip()
+            if keyword_clean and keyword_clean.lower() not in base_query.lower():
+                parts.append(keyword_clean)
+
+        if context.critical_sources:
+            parts.append(context.critical_sources[0])
+
+        lower_query = base_query.lower()
+        if 'официал' not in lower_query:
+            parts.append('официальный источник')
+        if 'подтвержден' not in lower_query:
+            parts.append('подтвержденные данные')
+
+        if failed_step and failed_step.get('tool') and failed_step['tool'] not in base_query:
+            parts.append(failed_step['tool'])
+
+        seen: Set[str] = set()
+        unique_parts: List[str] = []
+        for part in parts:
+            normalized = part.strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_parts.append(normalized)
+
+        return " ".join(unique_parts[:6]) if unique_parts else base_query
+
+    def _generate_recovery_steps(
+        self,
+        context: TaskContext,
+        plan: ExecutionPlan,
+        failed_step: Optional[Dict[str, Any]] = None,
+        include_fallback_plan: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Генерирует набор шагов для восстановления после ошибки."""
+        recovery_steps: List[Dict[str, Any]] = []
+
+        if include_fallback_plan and getattr(plan, 'fallback_plan', None):
+            for fallback in plan.fallback_plan:
+                candidate = fallback.copy()
+                candidate.setdefault('description', candidate.get('description', candidate.get('tool', 'Восстановление')))
+                candidate.setdefault('origin', 'auto_recovery_plan')
+                recovery_steps.append(candidate)
+
+        alt_query = self._build_alternative_query(context, failed_step)
+        if alt_query:
+            recovery_steps.append({
+                'tool': 'web_search',
+                'priority': (failed_step.get('priority', 0) + 1) if failed_step else 1,
+                'description': 'Повторный поиск с уточнением для восстановления контекста',
+                'parameters': {'query': alt_query, 'max_results': 8},
+                'expected_outcome': 'Новые подтвержденные источники информации',
+                'origin': 'auto_recovery_search'
+            })
+
+        return recovery_steps
+
+    def _attempt_auto_recovery(
+        self,
+        context: TaskContext,
+        plan: ExecutionPlan,
+        tool_name: str,
+        progress_info: Dict[str, Any],
+        result: ToolResult
+    ) -> Optional[str]:
+        """Пробует автоматически восстановиться после ошибки инструмента."""
+        if result.success:
+            return None
+
+        if not hasattr(plan, 'progress'):
+            self._initialize_plan_tracking(plan)
+
+        step_order = progress_info.get('step_order')
+        if step_order is None or step_order < 0 or step_order >= len(plan.steps):
+            return None
+
+        failed_step = plan.steps[step_order]
+        recovery_state = failed_step.setdefault('recovery_state', {})
+        attempts = failed_step.get('attempts', 0)
+        added_steps = False
+
+        if failed_step.get('fallback') and not recovery_state.get('fallback_added'):
+            fallback_step = self._build_fallback_step(failed_step)
+            if fallback_step:
+                self._insert_plan_step(
+                    plan,
+                    step_order + 1,
+                    fallback_step,
+                    note=f"Добавлен fallback после ошибки {tool_name}",
+                    origin='auto_recovery_fallback'
+                )
+                recovery_state['fallback_added'] = True
+                added_steps = True
+
+        if attempts >= 2 and not recovery_state.get('adaptive_plan_added'):
+            adaptive_steps = self._generate_recovery_steps(
+                context,
+                plan,
+                failed_step,
+                include_fallback_plan=True
+            )
+            insert_index = step_order + 1
+            for offset, step_def in enumerate(adaptive_steps):
+                self._insert_plan_step(
+                    plan,
+                    insert_index + offset,
+                    step_def,
+                    note=f"Добавлен адаптивный шаг восстановления ({step_def.get('tool')})",
+                    origin=step_def.get('origin', 'auto_recovery')
+                )
+                added_steps = True
+            recovery_state['adaptive_plan_added'] = bool(adaptive_steps)
+
+        if not added_steps and not recovery_state.get('search_recovery_added'):
+            search_steps = self._generate_recovery_steps(context, plan, failed_step, include_fallback_plan=False)
+            if search_steps:
+                self._insert_plan_step(
+                    plan,
+                    step_order + 1,
+                    search_steps[0],
+                    note="Добавлен шаг повторного поиска после ошибки",
+                    origin=search_steps[0].get('origin', 'auto_recovery')
+                )
+                recovery_state['search_recovery_added'] = True
+                added_steps = True
+
+        if not added_steps:
+            return None
+
+        plan.progress.setdefault('recovery_events', []).append({
+            'tool': tool_name,
+            'error': result.error,
+            'timestamp': datetime.now().isoformat(),
+            'attempts': attempts
+        })
+
+        return (
+            "🔄 Автовосстановление: инструмент "
+            f"{tool_name} вернул ошибку ({result.error}). План дополнен fallback/адаптивными шагами — "
+            "проанализируй причину сбоя, выполни новые шаги и перепроверь критические источники."
+        )
+
     def _build_plan_progress_payload(self, plan: ExecutionPlan) -> Dict[str, Any]:
         """Формирует краткое описание прогресса плана."""
         if not hasattr(plan, 'progress'):
@@ -3898,7 +4284,14 @@ class SmartAgent:
         if context.prohibited_actions:
             lines.append("Запреты: " + "; ".join(context.prohibited_actions[:1]) + ".")
 
-        lines.append("Всегда подтверждай данные ссылками на официальный источник и избегай догадок.")
+        if context.critical_sources:
+            lines.append("Приоритетные источники: " + "; ".join(context.critical_sources[:2]) + ".")
+        if context.monitoring_signals:
+            lines.append("Сигналы контроля: " + "; ".join(context.monitoring_signals[:2]) + ".")
+        if context.recovery_considerations:
+            lines.append("При сбое активируй восстановление: " + "; ".join(context.recovery_considerations[:1]) + ".")
+
+        lines.append("Всегда подтверждай данные ссылками на официальный источник, объясняй надежность источников и избегай догадок.")
 
         return "\n".join(lines)
 
@@ -3969,6 +4362,35 @@ class SmartAgent:
         if focus_lines:
             focus_section = "МОЙ ФОКУС НА НАМЕРЕНИЯХ:\n" + "\n".join(focus_lines)
 
+        source_lines: List[str] = []
+        if context.critical_sources:
+            source_lines.append("🔗 Критические источники:\n  - " + "\n  - ".join(context.critical_sources[:5]))
+        if context.source_priority:
+            source_lines.append("📊 Приоритет источников: " + "; ".join(context.source_priority[:2]))
+        if context.source_validation_steps:
+            source_lines.append("🧪 Проверка достоверности:\n  - " + "\n  - ".join(context.source_validation_steps[:3]))
+        if plan.source_strategy or context.source_strategy:
+            source_lines.append(f"📚 Стратегия по источникам: {plan.source_strategy or context.source_strategy}")
+        source_section = ""
+        if source_lines:
+            source_section = "МОЯ СТРАТЕГИЯ РАБОТЫ С ИСТОЧНИКАМИ:\n" + "\n".join(source_lines)
+
+        monitoring_signals = plan.monitoring_signals or context.monitoring_signals
+        monitoring_section = ""
+        if monitoring_signals:
+            monitoring_section = "СИГНАЛЫ МОНИТОРИНГА:\n  - " + "\n  - ".join(list(monitoring_signals)[:5])
+
+        recovery_lines: List[str] = []
+        if plan.recovery_strategy:
+            recovery_lines.append(f"🔄 План восстановления: {plan.recovery_strategy}")
+        if context.recovery_considerations:
+            recovery_lines.append("🧯 Альтернативы при сбоях:\n  - " + "\n  - ".join(context.recovery_considerations[:3]))
+        if context.risk_alerts:
+            recovery_lines.append("⚠️ Критические риски:\n  - " + "\n  - ".join(context.risk_alerts[:3]))
+        recovery_section = ""
+        if recovery_lines:
+            recovery_section = "МОЯ ГОТОВНОСТЬ К СБОЯМ:\n" + "\n".join(recovery_lines)
+
         return f"""Я - продвинутый интеллектуальный агент X-Master v77 Enhanced. Моя роль - эффективно решать задачи пользователей, используя доступные инструменты и глубокий анализ.
 
 МОЯ ТЕКУЩАЯ СИТУАЦИЯ:
@@ -3984,6 +4406,9 @@ class SmartAgent:
 {tools_status}
 
 {focus_section if focus_section else ''}
+{source_section if source_section else ''}
+{monitoring_section if monitoring_section else ''}
+{recovery_section if recovery_section else ''}
 
 {file_system_guidelines}
 
@@ -4012,6 +4437,8 @@ class SmartAgent:
 7. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
 8. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
 9. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
+10. Я приоритизирую проверенные источники, фиксирую ссылки и объясняю, почему им можно доверять
+11. При ошибках инструментов я автоматически инициирую восстановление: анализирую причину, задействую fallback-шаги и корректирую план
 
 МОИ МЕТАКОГНИТИВНЫЕ СПОСОБНОСТИ:
 - Я анализирую свои действия и корректирую план при необходимости
@@ -4024,6 +4451,7 @@ class SmartAgent:
 - Я фиксирую статус каждого шага плана и отмечаю завершенные инструменты
 - После каждого шага я напоминаю себе, какой инструмент идет следующим
 - Для длинных последовательностей я регулярно сверяюсь с планом и избегаю пропусков
+- Я отслеживаю ключевые сигналы (ошибки инструментов, отсутствие подтвержденных источников) и корректирую стратегию при их появлении
 
 СТРАТЕГИЯ РАБОТЫ С ВРЕМЕННЫМИ ДАННЫМИ:
 Поскольку сегодня {CURRENT_DATE_FORMATTED}, я:
@@ -4198,6 +4626,10 @@ class SmartAgent:
                     result = self.execute_function(func_name, func_args)
                     lazy_response_attempts = 0
                     progress_info = self._update_plan_progress(plan, func_name, result)
+                    recovery_instruction: Optional[str] = None
+                    if not result.success:
+                        recovery_instruction = self._attempt_auto_recovery(context, plan, func_name, progress_info, result)
+
                     planning_tool_changed = self.planning_tool.sync_with_plan(plan)
                     if planning_tool_changed:
                         plan.progress_notes.append(f"Planning Tool обновлен после вызова {func_name}")
@@ -4222,6 +4654,13 @@ class SmartAgent:
                         plan.progress_notes.append(f"Фокус-намерение усилено: {guardrail_reason}")
                         if len(plan.progress_notes) > 10:
                             plan.progress_notes = plan.progress_notes[-10:]
+
+                    if recovery_instruction:
+                        guardrail_message = (
+                            f"{guardrail_message}\n{recovery_instruction}"
+                            if guardrail_message
+                            else recovery_instruction
+                        )
 
                     plan_progress_payload = self._build_plan_progress_payload(plan)
 
