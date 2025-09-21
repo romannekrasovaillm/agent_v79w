@@ -16,7 +16,10 @@ import ast
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from html import unescape
 import trafilatura
 from datetime import datetime, date
 from io import BytesIO
@@ -495,6 +498,8 @@ class AdvancedTaskPlanner:
                         adapted_step = self._adapt_step_to_context(step, context)
                         adapted_steps.append(adapted_step)
 
+                    adapted_steps = self._postprocess_steps(adapted_steps, context)
+
                     return ExecutionPlan(
                         steps=adapted_steps,
                         reasoning=plan_data.get('reasoning', ''),
@@ -710,9 +715,208 @@ class AdvancedTaskPlanner:
             # Если нужна актуальная информация, используем специальные сайты
             if context.domain == 'finance' and any(kw in context.keywords for kw in ['ставка', 'цб']):
                 adapted['url'] = 'https://www.cbr.ru/'
-        
+
         return adapted
-    
+
+    def _needs_cbr_key_rate(self, context: TaskContext) -> bool:
+        query_lower = context.query.lower()
+        keywords = {kw.lower() for kw in context.keywords}
+
+        has_rate = any(indicator in query_lower for indicator in ['ключев', 'key rate', 'keyrate']) or any(
+            ('ставк' in kw or 'ключев' in kw) for kw in keywords
+        )
+
+        has_bank = any(indicator in query_lower for indicator in ['цб', 'банк россии', 'банка россии', 'банк рф', 'банка рф', 'cbr']) or any(
+            kw in {'цб', 'банк', 'cbr', 'россии'} for kw in keywords
+        )
+
+        return has_rate and has_bank
+
+    def _extract_explicit_date(self, text: str) -> Optional[datetime]:
+        if not text:
+            return None
+
+        numeric_match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})', text)
+        if numeric_match:
+            day, month, year = numeric_match.groups()
+            year_int = int(year)
+            if year_int < 100:
+                year_int += 2000
+            try:
+                return datetime(year_int, int(month), int(day))
+            except ValueError:
+                return None
+
+        text_lower = text.lower()
+        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', text_lower)
+        if month_match:
+            if 'кварт' in month_match.group(2):
+                return None
+
+            day = int(month_match.group(1))
+            month_token = month_match.group(2)
+            year_int = int(month_match.group(3))
+
+            month_map = {
+                'янв': 1,
+                'фев': 2,
+                'мар': 3,
+                'апр': 4,
+                'май': 5,
+                'мая': 5,
+                'июн': 6,
+                'июл': 7,
+                'авг': 8,
+                'сен': 9,
+                'окт': 10,
+                'ноя': 11,
+                'дек': 12
+            }
+
+            for prefix, month_value in month_map.items():
+                if month_token.startswith(prefix):
+                    try:
+                        return datetime(year_int, month_value, day)
+                    except ValueError:
+                        return None
+
+        return None
+
+    def _extract_quarter_period(self, text: str) -> Optional[Tuple[datetime, datetime]]:
+        text_lower = text.lower()
+
+        quarter = None
+        quarter_match = re.search(r'([1-4])\s*квартал', text_lower)
+        if quarter_match:
+            quarter = int(quarter_match.group(1))
+        else:
+            roman_match = re.search(r'\b(i{1,3}|iv)\s*квартал', text_lower)
+            if roman_match:
+                roman_map = {'i': 1, 'ii': 2, 'iii': 3, 'iv': 4}
+                quarter = roman_map.get(roman_match.group(1))
+        if quarter is None and 'квартал' in text_lower:
+            word_map = {'перв': 1, 'втор': 2, 'трет': 3, 'треть': 3, 'четв': 4}
+            for prefix, value in word_map.items():
+                if prefix in text_lower:
+                    quarter = value
+                    break
+
+        year_match = re.search(r'(20\d{2})', text_lower)
+        if quarter and year_match:
+            year = int(year_match.group(1))
+            start_month_map = {1: 1, 2: 4, 3: 7, 4: 10}
+            end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            start_dt = datetime(year, start_month_map[quarter], 1)
+            end_month, end_day = end_map[quarter]
+            end_dt = datetime(year, end_month, end_day)
+            return start_dt, end_dt
+
+        return None
+
+    def _prepare_cbr_parameters(self, context: TaskContext) -> Dict[str, Any]:
+        parameters: Dict[str, Any] = {}
+        query_text = context.query
+        query_lower = query_text.lower()
+
+        quarter_period = self._extract_quarter_period(query_text)
+        explicit_date = self._extract_explicit_date(query_text)
+
+        start_dt: Optional[datetime] = None
+        end_dt: Optional[datetime] = None
+        target_dt: Optional[datetime] = None
+
+        if quarter_period:
+            start_dt, end_dt = quarter_period
+            target_dt = end_dt
+
+        if explicit_date:
+            target_dt = explicit_date
+
+        if target_dt and start_dt and target_dt < start_dt:
+            start_dt = target_dt
+        if target_dt and end_dt and target_dt > end_dt:
+            end_dt = target_dt
+
+        if target_dt and not start_dt and not end_dt:
+            start_dt = target_dt
+            end_dt = target_dt
+
+        if start_dt:
+            parameters['start_date'] = start_dt.strftime('%d.%m.%Y')
+        if end_dt:
+            parameters['end_date'] = end_dt.strftime('%d.%m.%Y')
+        if target_dt:
+            parameters['target_date'] = target_dt.strftime('%d.%m.%Y')
+
+        parameters['return_all'] = context.requires_excel or any(
+            token in query_lower for token in ['excel', 'эксель', 'таблиц', 'сохран']
+        )
+
+        return parameters
+
+    def _build_cbr_parse_parameters(self, cbr_params: Dict[str, Any]) -> Dict[str, Any]:
+        start = cbr_params.get('start_date')
+        end = cbr_params.get('end_date')
+
+        query_params = {'UniDbQuery.Posted': 'True'}
+        if start:
+            query_params['UniDbQuery.From'] = start
+        if end:
+            query_params['UniDbQuery.To'] = end
+
+        if not start and not end:
+            return {
+                'url': 'https://www.cbr.ru/hd_base/KeyRate/',
+                'extract_focus': 'ключевая ставка; таблица; Банк России'
+            }
+
+        return {
+            'url': f"https://www.cbr.ru/hd_base/KeyRate/?{urlencode(query_params)}",
+            'extract_focus': 'ключевая ставка; таблица; Банк России'
+        }
+
+    def _postprocess_steps(self, steps: List[Dict[str, Any]], context: TaskContext) -> List[Dict[str, Any]]:
+        if not steps:
+            return steps
+
+        processed_steps = [step.copy() for step in steps]
+
+        if self._needs_cbr_key_rate(context):
+            cbr_params = self._prepare_cbr_parameters(context)
+
+            has_cbr_step = False
+            for step in processed_steps:
+                if step.get('tool') == 'cbr_key_rate':
+                    step.setdefault('description', 'Получение ключевой ставки Банка России из официального источника')
+                    step.setdefault('priority', 1)
+                    for key, value in cbr_params.items():
+                        if value is not None:
+                            step[key] = value
+                    has_cbr_step = True
+
+            if not has_cbr_step:
+                new_step = {
+                    'tool': 'cbr_key_rate',
+                    'priority': 1,
+                    'description': 'Получение ключевой ставки Банка России из официального источника'
+                }
+                for key, value in cbr_params.items():
+                    if value is not None:
+                        new_step[key] = value
+                processed_steps.insert(0, new_step)
+
+            processed_steps = [step for step in processed_steps if step.get('tool') != 'web_search']
+
+            parse_updates = self._build_cbr_parse_parameters(cbr_params)
+            for step in processed_steps:
+                if step.get('tool') == 'web_parse':
+                    step.setdefault('description', 'Извлечение таблицы ключевой ставки с cbr.ru')
+                    for key, value in parse_updates.items():
+                        if value is not None:
+                            step[key] = value
+
+        return processed_steps
+
     def _create_basic_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает базовый план (fallback)."""
         steps = []
@@ -735,7 +939,9 @@ class AdvancedTaskPlanner:
                 'priority': 10,
                 'description': 'Экспорт результатов в Excel'
             })
-        
+
+        steps = self._postprocess_steps(steps, context)
+
         estimated_time = len(steps) * 5.0
 
         return ExecutionPlan(
@@ -1851,6 +2057,333 @@ class BrowserTool:
             )
 
 
+class CBRDataTool:
+    """Инструмент для получения ключевой ставки Банка России с официального сайта."""
+
+    MONTH_PREFIXES = {
+        'январ': 1,
+        'янв': 1,
+        'феврал': 2,
+        'фев': 2,
+        'март': 3,
+        'мар': 3,
+        'апрел': 4,
+        'апр': 4,
+        'мая': 5,
+        'май': 5,
+        'июн': 6,
+        'июл': 7,
+        'август': 8,
+        'авг': 8,
+        'сентябр': 9,
+        'сен': 9,
+        'октябр': 10,
+        'окт': 10,
+        'ноябр': 11,
+        'ноя': 11,
+        'декабр': 12,
+        'дек': 12
+    }
+
+    def __init__(self):
+        self.available = True
+        self.base_url = "https://www.cbr.ru/hd_base/KeyRate/"
+        self.logger = logging.getLogger("CBRDataTool")
+
+    def fetch_key_rate(
+        self,
+        target_date: Optional[Union[str, date, datetime]] = None,
+        start_date: Optional[Union[str, date, datetime]] = None,
+        end_date: Optional[Union[str, date, datetime]] = None,
+        return_all: Union[bool, str, int] = False
+    ) -> ToolResult:
+        """Возвращает значения ключевой ставки за указанный период."""
+
+        start_time = time.time()
+
+        if not self.available:
+            return ToolResult(
+                tool_name="cbr_key_rate",
+                success=False,
+                data=None,
+                error="Инструмент получения данных ЦБ недоступен",
+                execution_time=time.time() - start_time
+            )
+
+        try:
+            normalized_start = self._parse_date_input(start_date)
+            normalized_end = self._parse_date_input(end_date)
+            normalized_target = self._parse_date_input(target_date)
+            return_all_flag = self._to_bool(return_all)
+
+            if normalized_target and not (normalized_start or normalized_end):
+                normalized_start = normalized_target
+                normalized_end = normalized_target
+
+            if normalized_start and normalized_end and normalized_start > normalized_end:
+                normalized_start, normalized_end = normalized_end, normalized_start
+
+            if normalized_target:
+                if normalized_start and normalized_target < normalized_start:
+                    normalized_start = normalized_target
+                if normalized_end and normalized_target > normalized_end:
+                    normalized_end = normalized_target
+
+            html, request_url = self._download_dataset(normalized_start, normalized_end)
+            execution_time = time.time() - start_time
+
+            if html is None:
+                return ToolResult(
+                    tool_name="cbr_key_rate",
+                    success=False,
+                    data=None,
+                    error="Не удалось загрузить данные с сайта Банка России",
+                    metadata={'request_url': request_url},
+                    execution_time=execution_time
+                )
+
+            records = self._extract_records(html)
+
+            if not records:
+                return ToolResult(
+                    tool_name="cbr_key_rate",
+                    success=False,
+                    data=None,
+                    error="На странице Банка России не найдены данные о ключевой ставке",
+                    metadata={'request_url': request_url},
+                    execution_time=execution_time
+                )
+
+            period_start_iso = normalized_start.strftime('%Y-%m-%d') if normalized_start else (records[-1]['date'] if records else None)
+            period_end_iso = normalized_end.strftime('%Y-%m-%d') if normalized_end else (records[0]['date'] if records else None)
+
+            filtered_records = records
+            if normalized_start or normalized_end:
+                filtered_records = [
+                    rec for rec in records
+                    if (not normalized_start or datetime.strptime(rec['date'], '%Y-%m-%d') >= normalized_start)
+                    and (not normalized_end or datetime.strptime(rec['date'], '%Y-%m-%d') <= normalized_end)
+                ]
+                if not filtered_records:
+                    filtered_records = records
+
+            match_record = None
+            if normalized_target:
+                match_record = self._select_record_for_date(records, normalized_target)
+            elif filtered_records:
+                match_record = filtered_records[0]
+
+            result_records = filtered_records if return_all_flag else ([match_record] if match_record else filtered_records[:1])
+
+            if not result_records:
+                result_records = records[:1]
+                match_record = result_records[0] if result_records else None
+
+            note = None
+            if normalized_target and match_record:
+                match_date = datetime.strptime(match_record['date'], '%Y-%m-%d')
+                if match_date != normalized_target:
+                    note = "Запрошенная дата отсутствует, возвращено ближайшее доступное значение"
+
+            data_payload = {
+                'records': result_records,
+                'match': match_record,
+                'target_date': normalized_target.strftime('%Y-%m-%d') if normalized_target else None,
+                'period': {
+                    'start': period_start_iso,
+                    'end': period_end_iso
+                },
+                'source_url': request_url,
+                'official_source': self.base_url,
+                'retrieved_at': CURRENT_DATE.isoformat()
+            }
+
+            if note:
+                data_payload['note'] = note
+
+            metadata = {
+                'records_returned': len(result_records),
+                'records_available': len(records),
+                'request_url': request_url,
+                'start_date': period_start_iso,
+                'end_date': period_end_iso,
+                'target_date': data_payload['target_date'],
+                'source': 'Банк России (cbr.ru)'
+            }
+
+            confidence = 0.95 if match_record else 0.8
+
+            return ToolResult(
+                tool_name="cbr_key_rate",
+                success=True,
+                data=data_payload,
+                metadata=metadata,
+                execution_time=execution_time,
+                confidence=confidence
+            )
+
+        except Exception as error:
+            execution_time = time.time() - start_time
+            self.logger.error("Ошибка получения ключевой ставки: %s", error)
+            return ToolResult(
+                tool_name="cbr_key_rate",
+                success=False,
+                data=None,
+                error=str(error),
+                execution_time=execution_time
+            )
+
+    def _to_bool(self, value: Union[bool, str, int, float]) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {'1', 'true', 'yes', 'y', 'да', 'истина'}
+        return bool(value)
+
+    def _parse_date_input(self, value: Optional[Union[str, date, datetime]]) -> Optional[datetime]:
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return value.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        cleaned = text.lower().replace('года', '').replace('г.', '').replace('год', '').strip()
+
+        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', cleaned)
+        if month_match:
+            day = int(month_match.group(1))
+            month_text = month_match.group(2)
+            year = int(month_match.group(3))
+            month = self._month_from_text(month_text)
+            if month:
+                try:
+                    return datetime(year, month, day)
+                except ValueError:
+                    return None
+
+        normalized = cleaned.replace('/', '.').replace('-', '.').replace('\u00a0', '')
+
+        for fmt in ("%d.%m.%Y", "%Y.%m.%d", "%d.%m.%y"):
+            try:
+                parsed = datetime.strptime(normalized, fmt)
+                if fmt == "%d.%m.%y" and parsed.year < 2000:
+                    parsed = parsed.replace(year=parsed.year + 2000)
+                return parsed
+            except ValueError:
+                continue
+
+        return None
+
+    def _month_from_text(self, text: str) -> Optional[int]:
+        for prefix, month in self.MONTH_PREFIXES.items():
+            if text.startswith(prefix):
+                return month
+        return None
+
+    def _download_dataset(self, start: Optional[datetime], end: Optional[datetime]) -> Tuple[Optional[str], str]:
+        params = {}
+        if start or end:
+            params['UniDbQuery.Posted'] = 'True'
+            if start:
+                params['UniDbQuery.From'] = start.strftime('%d.%m.%Y')
+            if end:
+                params['UniDbQuery.To'] = end.strftime('%d.%m.%Y')
+
+        request_url = self.base_url if not params else f"{self.base_url}?{urlencode(params)}"
+
+        try:
+            request = Request(
+                request_url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
+                }
+            )
+            with urlopen(request, timeout=30) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+            return html, request_url
+        except (HTTPError, URLError) as error:
+            self.logger.error("Ошибка загрузки страницы Банка России: %s", error)
+            return None, request_url
+        except Exception as error:
+            self.logger.error("Неожиданная ошибка загрузки данных ЦБ: %s", error)
+            return None, request_url
+
+    def _extract_records(self, html: str) -> List[Dict[str, Any]]:
+        if not html:
+            return []
+
+        table_pattern = re.compile(r'<table[^>]*>(.*?)</table>', re.IGNORECASE | re.DOTALL)
+        row_pattern = re.compile(r'<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*</tr>', re.IGNORECASE | re.DOTALL)
+
+        records: List[Dict[str, Any]] = []
+        seen_dates: Set[str] = set()
+
+        for table_html in table_pattern.findall(html):
+            for date_raw, rate_raw in row_pattern.findall(table_html):
+                date_text = unescape(date_raw).strip()
+                rate_text = unescape(rate_raw).strip()
+
+                if not re.match(r'\d{2}\.\d{2}\.\d{4}', date_text):
+                    continue
+
+                try:
+                    parsed_date = datetime.strptime(date_text, '%d.%m.%Y')
+                except ValueError:
+                    continue
+
+                iso_date = parsed_date.strftime('%Y-%m-%d')
+                if iso_date in seen_dates:
+                    continue
+
+                try:
+                    rate_value = float(rate_text.replace(',', '.').replace(' ', ''))
+                except ValueError:
+                    continue
+
+                records.append({
+                    'date': iso_date,
+                    'display_date': date_text,
+                    'rate_percent': rate_value,
+                    'rate_display': rate_text,
+                    'source': self.base_url
+                })
+                seen_dates.add(iso_date)
+
+        records.sort(key=lambda item: item['date'], reverse=True)
+        return records
+
+    def _select_record_for_date(self, records: List[Dict[str, Any]], target: datetime) -> Optional[Dict[str, Any]]:
+        if not records:
+            return None
+
+        target_date = target.date()
+
+        for record in records:
+            record_date = datetime.strptime(record['date'], '%Y-%m-%d').date()
+            if record_date == target_date:
+                return record
+
+        earlier = [
+            record for record in records
+            if datetime.strptime(record['date'], '%Y-%m-%d').date() <= target_date
+        ]
+
+        if earlier:
+            return earlier[0]
+
+        return records[-1] if records else None
+
+
 class ExcelExporter:
     """Класс для экспорта данных в Excel."""
 
@@ -2648,6 +3181,7 @@ class SmartAgent:
         self.web_search = WebSearchTool()
         self.web_parser = WebParsingTool()
         self.browser = BrowserTool()
+        self.cbr_data_tool = CBRDataTool()
         self.code_executor = CodeExecutor()
         self.excel_exporter = ExcelExporter()
         self.file_system = FileSystemTools()
@@ -2767,7 +3301,35 @@ class SmartAgent:
                     }
                 }
             ])
-        
+
+        if getattr(self, 'cbr_data_tool', None) and self.cbr_data_tool.available:
+            functions.append({
+                "name": "cbr_key_rate",
+                "description": "Получает ключевую ставку Банка России напрямую с официального сайта cbr.ru",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target_date": {
+                            "type": "string",
+                            "description": "Дата, для которой нужно найти ставку (форматы ДД.ММ.ГГГГ или YYYY-MM-DD)"
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "description": "Начало периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "Конец периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
+                        },
+                        "return_all": {
+                            "type": "boolean",
+                            "description": "Возвращать весь период вместо одного значения",
+                            "default": False
+                        }
+                    }
+                }
+            })
+
         functions.append({
             "name": "code_execute",
             "description": "Выполняет Python код для вычислений, анализа и экспорта в Excel",
@@ -2957,7 +3519,15 @@ class SmartAgent:
                 return self.browser.wait_for_dynamic_content(
                     timeout=arguments.get("timeout", 10000)
                 )
-            
+
+            elif function_name == "cbr_key_rate":
+                return self.cbr_data_tool.fetch_key_rate(
+                    target_date=arguments.get("target_date"),
+                    start_date=arguments.get("start_date"),
+                    end_date=arguments.get("end_date"),
+                    return_all=arguments.get("return_all", False)
+                )
+
             elif function_name == "code_execute":
                 return self.code_executor.execute(code=arguments.get("code"))
             
@@ -3284,6 +3854,7 @@ class SmartAgent:
 🔍 Веб-поиск: {'✅ Работает' if self.web_search.available else '❌ Недоступен'}
 📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}
 🌐 Браузер: {'✅ Работает' if self.browser.available else '❌ Недоступен'}
+🏦 Официальные данные ЦБ РФ: {'✅ Работает' if self.cbr_data_tool.available else '❌ Недоступен'} (функция cbr_key_rate)
 💻 Выполнение кода: ✅ Работает
 📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}
 🗂️ Файловая память: ✅ Работает (каталог: {self.file_system.base_dir})"""
@@ -3330,7 +3901,7 @@ class SmartAgent:
 4. Для динамических сайтов я обязательно жду загрузки контента
 5. Я синтезирую информацию из разных источников для полного ответа
 6. Я учитываю текущую дату при поиске актуальной информации
-7. Для финансовых данных я использую браузер для работы с официальными сайтами{excel_info}
+7. Для ключевой ставки Банка России я обязательно вызываю cbr_key_rate, получаю данные с https://www.cbr.ru/hd_base/KeyRate/ и не подставляю значения из сторонних источников{excel_info}
 8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
 9. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
 10. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
