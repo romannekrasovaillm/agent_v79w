@@ -223,6 +223,70 @@ class AdvancedIntentAnalyzer:
    - Что делать, если нужный инструмент или источник недоступны?
    - Какие альтернативы и запасные варианты стоит подготовить?
 
+ПРИМЕРЫ АНАЛИЗА:
+1) Финансовые новости.
+   Запрос: "Найди свежие новости о ключевой ставке ЦБ и сделай сводку по трем источникам".
+   Ответ:
+   {{
+       "intent": "собрать актуальные новости о ключевой ставке ЦБ",
+       "user_goal": "information",
+       "requires_search": true,
+       "requires_browser": false,
+       "requires_computation": false,
+       "requires_terminal": false,
+       "complexity": "medium",
+       "domain": "finance",
+       "urgency": "high",
+       "temporal_context": "current",
+       "expected_sources": 3,
+       "keywords": ["ключевая ставка", "ЦБ РФ", "новости"],
+       "success_criteria": ["использованы официальные или надежные источники", "приведена краткая сводка по каждому источнику"],
+       "reasoning": "Запрос касается актуальных финансовых новостей, поэтому нужен веб-поиск с акцентом на надежность источников.",
+       "confidence_score": 0.82
+   }}
+
+2) Программирование.
+   Запрос: "Напиши скрипт Python, который анализирует CSV с продажами и строит график".
+   Ответ:
+   {{
+       "intent": "подготовить пример кода на Python для анализа CSV и визуализации",
+       "user_goal": "analysis",
+       "requires_search": false,
+       "requires_browser": false,
+       "requires_computation": true,
+       "requires_terminal": true,
+       "complexity": "medium",
+       "domain": "software",
+       "urgency": "normal",
+       "temporal_context": "current",
+       "expected_sources": 1,
+       "keywords": ["python", "csv", "анализ продаж", "график"],
+       "success_criteria": ["представлен корректный пример кода", "объяснено как запустить скрипт"],
+       "reasoning": "Задача требует генерации и объяснения кода, поэтому нужны вычисления и запуск команд в терминале.",
+       "confidence_score": 0.78
+   }}
+
+3) Аналитика данных.
+   Запрос: "Сравни динамику населения Москвы за 2020-2023 годы и сделай выводы для презентации".
+   Ответ:
+   {{
+       "intent": "проанализировать статистику населения Москвы по годам",
+       "user_goal": "analysis",
+       "requires_search": true,
+       "requires_browser": true,
+       "requires_computation": true,
+       "requires_terminal": false,
+       "complexity": "complex",
+       "domain": "demography",
+       "urgency": "normal",
+       "temporal_context": "historical",
+       "expected_sources": 2,
+       "keywords": ["Москва", "численность населения", "2020", "2023"],
+       "success_criteria": ["использованы официальные статистические данные", "сформулированы выводы для презентации"],
+       "reasoning": "Нужно найти исторические данные, сверить несколько периодов и сформировать аналитические выводы.",
+       "confidence_score": 0.75
+   }}
+
 Я отвечу в формате JSON:
 {{
     "intent": "основное намерение",
@@ -647,6 +711,141 @@ class AdvancedTaskPlanner:
 5. ОЦЕНКА РИСКОВ:
    - Что может пойти не так?
    - Какие альтернативы подготовить?
+
+ПРИМЕРЫ ПЛАНОВ:
+ПРИМЕР 1 — Исследование рынка.
+Запрос: "Проанализируй конкурентные цены на рынке доставки еды в Москве и подготовь отчет".
+Ожидаемый ответ:
+{{
+    "steps": [
+        {{
+            "tool": "web_search",
+            "priority": 1,
+            "description": "Найти свежие обзоры и новости по тарифам доставки еды в Москве",
+            "parameters": {{"query": "сравнение тарифов доставки еды Москва 2024"}},
+            "expected_outcome": "Список из 3-5 актуальных материалов с ценами и аналитикой",
+            "fallback": "browser_navigate"
+        }},
+        {{
+            "tool": "browser_navigate",
+            "priority": 2,
+            "description": "Открыть сайты ключевых сервисов доставки и зафиксировать тарифы",
+            "parameters": {{"urls": ["https://example-service.ru", "https://example-competitor.ru"]}},
+            "expected_outcome": "Таблица с базовыми тарифами крупных игроков рынка",
+            "fallback": "browser_extract"
+        }},
+        {{
+            "tool": "code_execute",
+            "priority": 3,
+            "description": "Систематизировать собранные данные и подготовить текстовые выводы",
+            "parameters": {{"language": "python"}},
+            "expected_outcome": "Структурированная таблица и краткие выводы для отчета",
+            "fallback": "write_file"
+        }}
+    ],
+    "reasoning": "План сочетает общий обзор, проверку первоисточников и аналитическую обработку в удобном формате.",
+    "estimated_time": 1800,
+    "confidence": 0.76,
+    "risk_assessment": {{
+        "high_risk": "На сайтах конкурентов могут отсутствовать актуальные тарифы",
+        "medium_risk": "Часть обзоров может быть устаревшей",
+        "mitigation": "Проверять дату публикации и сверять данные минимум из двух источников"
+    }},
+    "success_criteria": ["Собраны тарифы минимум трех конкурентов", "Сформирована таблица с выводами"],
+    "adaptability_level": "high"
+}}
+
+ПРИМЕР 2 — Автоматизация обработки данных.
+Запрос: "Создай скрипт, который очищает CSV с данными о клиентах и сохраняет отчет в Excel".
+Ожидаемый ответ:
+{{
+    "steps": [
+        {{
+            "tool": "ls",
+            "priority": 1,
+            "description": "Проверить наличие входного файла и вспомогательных каталогов",
+            "parameters": {{"path": "."}},
+            "expected_outcome": "Подтверждено расположение исходного CSV",
+            "fallback": "read_file"
+        }},
+        {{
+            "tool": "read_file",
+            "priority": 2,
+            "description": "Просмотреть первые строки CSV, чтобы определить проблемы с данными",
+            "parameters": {{"path": "data/raw_clients.csv", "limit": 20}},
+            "expected_outcome": "Понимание структуры и возможных артефактов",
+            "fallback": "code_execute"
+        }},
+        {{
+            "tool": "code_execute",
+            "priority": 3,
+            "description": "Написать Python-скрипт для очистки данных и экспорта итогов в Excel",
+            "parameters": {{"language": "python"}},
+            "expected_outcome": "Создан чистый набор данных и файл отчета формата XLSX",
+            "fallback": "write_file"
+        }}
+    ],
+    "reasoning": "Сначала убеждаемся в доступности данных, затем изучаем структуру и только после этого автоматизируем обработку.",
+    "estimated_time": 2400,
+    "confidence": 0.72,
+    "risk_assessment": {{
+        "high_risk": "Файл может содержать поврежденные строки",
+        "medium_risk": "Возможна потеря данных при некорректной очистке",
+        "mitigation": "Сделать резервную копию исходного файла и проверять результат скрипта"
+    }},
+    "success_criteria": ["Скрипт очищает данные без ошибок", "Отчет сохранен в Excel и задокументирован"],
+    "adaptability_level": "medium"
+}}
+
+ПРИМЕР 3 — Работа с динамическим контентом.
+Запрос: "Отследи расписание вебинара на сайте, дождись появления кнопки регистрации и сохрани подтверждение".
+Ожидаемый ответ:
+{{
+    "steps": [
+        {{
+            "tool": "browser_navigate",
+            "priority": 1,
+            "description": "Открыть страницу вебинара в браузере",
+            "parameters": {{"url": "https://example-webinar.com"}},
+            "expected_outcome": "Страница загружена и готова к дальнейшим действиям",
+            "fallback": "web_search"
+        }},
+        {{
+            "tool": "wait_dynamic_content",
+            "priority": 2,
+            "description": "Дождаться появления активной кнопки регистрации",
+            "parameters": {{"css_selector": "button.register"}},
+            "expected_outcome": "Кнопка регистрации стала доступной для клика",
+            "fallback": "browser_extract"
+        }},
+        {{
+            "tool": "browser_click",
+            "priority": 3,
+            "description": "Нажать кнопку и перейти к форме регистрации",
+            "parameters": {{"css_selector": "button.register"}},
+            "expected_outcome": "Открыта форма регистрации, данные готовы к сохранению",
+            "fallback": "browser_extract"
+        }},
+        {{
+            "tool": "browser_extract",
+            "priority": 4,
+            "description": "Сохранить подтверждение или детали регистрационной формы",
+            "parameters": {{"fields": ["title", "schedule", "confirmation"]}},
+            "expected_outcome": "Фиксированы ключевые данные о вебинаре",
+            "fallback": "write_file"
+        }}
+    ],
+    "reasoning": "Используем браузер для динамического сайта, контролируем появление элементов и фиксируем подтверждение участия.",
+    "estimated_time": 1500,
+    "confidence": 0.74,
+    "risk_assessment": {{
+        "high_risk": "Кнопка регистрации может не появиться из-за региональных ограничений",
+        "medium_risk": "Сайт может потребовать авторизацию",
+        "mitigation": "Проверять состояние элемента с тайм-аутом и готовить альтернативные страницы"
+    }},
+    "success_criteria": ["Кнопка регистрации успешно найдена и нажата", "Данные подтверждения сохранены"],
+    "adaptability_level": "high"
+}}
 
 Я отвечу в формате JSON:
 {{
@@ -3202,6 +3401,159 @@ class PlanningToolManager:
 
         return requires_multitool
 
+    def _shorten_text(self, text: Any, limit: int = 120) -> str:
+        """Сжимает текст до указанной длины без потери смысла."""
+        if text is None:
+            return ""
+
+        sanitized = re.sub(r"\s+", " ", str(text)).strip()
+        if len(sanitized) <= limit:
+            return sanitized
+
+        if limit <= 3:
+            return sanitized[:limit]
+
+        return sanitized[: limit - 3].rstrip() + "..."
+
+    def _format_param_value(self, value: Any, limit: int = 40) -> str:
+        """Подготавливает краткое текстовое представление параметров инструмента."""
+        if value is None:
+            return ""
+
+        if isinstance(value, (int, float)):
+            return str(value)
+
+        if isinstance(value, str):
+            return self._shorten_text(value, limit)
+
+        if isinstance(value, dict):
+            parts: List[str] = []
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 2:
+                    break
+                formatted = self._format_param_value(item, max(10, limit // 2))
+                if formatted:
+                    parts.append(f"{key}:{formatted}")
+
+            suffix = ""
+            if len(value) > 2:
+                suffix = (", ..." if parts else "...")
+
+            return self._shorten_text("{" + ", ".join(parts) + suffix + "}", limit)
+
+        if isinstance(value, (list, tuple, set)):
+            sequence = list(value)
+            items: List[str] = []
+            for index, item in enumerate(sequence):
+                if index >= 3:
+                    break
+                formatted = self._format_param_value(item, max(10, limit // 2))
+                if formatted:
+                    items.append(formatted)
+
+            if len(sequence) > 3:
+                items.append("...")
+
+            return self._shorten_text("[" + ", ".join(items) + "]", limit)
+
+        return self._shorten_text(str(value), limit)
+
+    def _summarize_parameters(self, parameters: Any) -> str:
+        """Строит краткое описание параметров шага плана."""
+        if not parameters:
+            return ""
+
+        try:
+            if isinstance(parameters, dict):
+                items: List[str] = []
+                for index, (key, value) in enumerate(parameters.items()):
+                    if index >= 3:
+                        break
+                    formatted = self._format_param_value(value)
+                    if formatted:
+                        items.append(f"{key}={formatted}")
+
+                summary = ", ".join(items)
+                if len(parameters) > 3:
+                    summary += ", ..."
+                return summary
+
+            if isinstance(parameters, (list, tuple, set)):
+                return self._format_param_value(parameters)
+
+            return self._format_param_value(parameters)
+        except Exception as error:
+            logger.debug(f"Не удалось сформировать описание параметров: {error}")
+            return self._shorten_text(parameters, 60)
+
+    def _ensure_sentence(self, text: str, fallback: str = "Выполнить шаг плана") -> str:
+        """Приводит текст к форме аккуратного предложения."""
+        candidate = self._shorten_text(text or fallback, 140).strip()
+        if not candidate:
+            candidate = fallback
+
+        if candidate and candidate[0].islower():
+            candidate = candidate[0].upper() + candidate[1:]
+
+        if candidate and candidate[-1] not in {'.', '!', '?'}:
+            candidate += '.'
+
+        return candidate
+
+    def _build_todo_content(self, index: int, step: Dict[str, Any]) -> str:
+        """Переписывает шаг плана в развернутую задачу todo."""
+        if not isinstance(step, dict):
+            sentence = self._ensure_sentence(str(step))
+            return f"Шаг {index}: {sentence}"
+
+        tool_name = self._shorten_text(step.get("tool", ""), 40)
+
+        action_source = None
+        action_text = ""
+        for field in ("description", "expected_outcome", "summary", "task", "note"):
+            value = step.get(field)
+            if value:
+                action_source = field
+                action_text = str(value)
+                break
+
+        if not action_text and tool_name:
+            action_source = "tool"
+            action_text = f"Вызвать инструмент {tool_name}"
+
+        sentence = self._ensure_sentence(action_text)
+
+        details: List[str] = []
+
+        priority = step.get("priority")
+        if priority not in (None, "", "не указан"):
+            details.append(f"приоритет {priority}")
+
+        if tool_name and action_source != "tool":
+            details.append(f"инструмент {tool_name}")
+
+        params_summary = self._summarize_parameters(step.get("parameters"))
+        if params_summary:
+            details.append(f"параметры: {params_summary}")
+
+        expected_outcome = step.get("expected_outcome")
+        if expected_outcome and action_source != "expected_outcome":
+            details.append("ожидается: " + self._shorten_text(expected_outcome, 100))
+
+        fallback_tool = step.get("fallback")
+        if fallback_tool:
+            details.append("резерв: " + self._shorten_text(fallback_tool, 60))
+
+        note_value = next((step.get(key) for key in ("notes", "context", "hint", "comment") if step.get(key)), None)
+        if note_value:
+            details.append("заметка: " + self._shorten_text(note_value, 80))
+
+        todo_text = f"Шаг {index}: {sentence}"
+        if details:
+            todo_text += " Дополнительно: " + "; ".join(details) + "."
+
+        return todo_text
+
     def initialize_from_plan(self, plan: ExecutionPlan) -> List[Dict[str, str]]:
         """Создает todo-список на основе плана выполнения."""
         self.todos = []
@@ -3211,8 +3563,12 @@ class PlanningToolManager:
             return []
 
         for idx, step in enumerate(plan.steps, 1):
-            description = step.get("description") or step.get("expected_outcome") or step.get("tool", "Шаг")
-            content = f"Шаг {idx}: {description}".strip()
+            if isinstance(step, dict):
+                content = self._build_todo_content(idx, step)
+            else:
+                sentence = self._ensure_sentence(str(step))
+                content = f"Шаг {idx}: {sentence}".strip()
+
             self.todos.append(TodoItem(content=content, status="pending"))
 
         if self.todos:
