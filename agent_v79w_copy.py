@@ -16,16 +16,10 @@ import ast
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
-from urllib.parse import urlparse, urljoin, urlencode
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-from html import unescape
+from urllib.parse import urlparse
 import trafilatura
 from datetime import datetime, date
-from io import BytesIO
-from collections import defaultdict, Counter
 from dataclasses import dataclass, field, asdict
-from enum import Enum
 from typing import List, Dict, Any, Optional, Tuple, Union, Callable, Set
 from pathlib import Path
 import concurrent.futures
@@ -77,24 +71,6 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logging.warning("Playwright не установлен. Браузер будет недоступен.")
 
-# Excel support
-try:
-    import openpyxl
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    EXCEL_AVAILABLE = True
-except ImportError:
-    try:
-        import xlsxwriter
-        EXCEL_AVAILABLE = True
-        EXCEL_ENGINE = 'xlsxwriter'
-    except ImportError:
-        EXCEL_AVAILABLE = False
-        logging.warning("Поддержка Excel недоступна. Установите: pip install openpyxl или xlsxwriter")
-
-if EXCEL_AVAILABLE and 'openpyxl' in locals():
-    EXCEL_ENGINE = 'openpyxl'
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -129,7 +105,7 @@ class TaskContext:
     requires_search: bool = False
     requires_browser: bool = False
     requires_computation: bool = False
-    requires_excel: bool = False
+    requires_terminal: bool = False
     complexity: str = "simple"  # simple, medium, complex
     domain: str = "general"
     keywords: List[str] = field(default_factory=list)
@@ -175,28 +151,7 @@ class AdvancedIntentAnalyzer:
     
     def __init__(self, gigachat_client):
         self.client = gigachat_client
-        self.search_indicators = [
-            'найди', 'поищи', 'что такое', 'кто такой', 'где находится',
-            'когда происходит', 'как работает', 'почему', 'узнай',
-            'информация', 'данные', 'статистика', 'новости', 'последние',
-            'сегодня', 'вчера', 'на этой неделе', 'текущий', 'актуальный'
-        ]
-        
-        self.browser_indicators = [
-            'сайт', 'страница', 'url', 'ссылка', 'перейди на', 'открой',
-            'скачай', 'зарегистрируйся', 'заполни форму', 'нажми', 'интерактивно'
-        ]
-        
-        self.computation_indicators = [
-            'посчитай', 'вычисли', 'рассчитай', 'сколько', 'формула',
-            'график', 'диаграмма', 'анализ', 'сравни', 'проанализируй'
-        ]
-        
-        self.excel_indicators = [
-            'excel', 'таблица', 'экспорт', 'выгрузи', 'сохрани в',
-            'создай файл', 'отчет', 'xlsx', 'csv'
-        ]
-    
+
     def analyze_with_llm(self, query: str) -> TaskContext:
         """Анализирует запрос с помощью LLM для глубокого понимания намерений."""
         
@@ -222,12 +177,7 @@ class AdvancedIntentAnalyzer:
    - Нужен ли веб-поиск для получения свежей информации?
    - Требуется ли интерактивная работа с браузером?
    - Нужны ли вычисления или анализ данных?
-   - Следует ли экспортировать результат в Excel?
-
-4. СЛОЖНОСТЬ И ОБЛАСТЬ:
-   - Насколько сложна задача? (простая/средняя/сложная)
-   - К какой предметной области относится?
-   - Сколько этапов потребуется для решения?
+   - Потребуется ли терминал или работа с файлами?
 
 5. КРИТЕРИИ УСПЕХА:
    - Как я пойму, что задача решена правильно?
@@ -240,7 +190,7 @@ class AdvancedIntentAnalyzer:
     "requires_search": true/false,
     "requires_browser": true/false,
     "requires_computation": true/false,
-    "requires_excel": true/false,
+    "requires_terminal": true/false,
     "complexity": "simple/medium/complex",
     "domain": "область знаний",
     "urgency": "low/normal/high/critical",
@@ -279,7 +229,7 @@ class AdvancedIntentAnalyzer:
                         requires_search=analysis_data.get('requires_search', False),
                         requires_browser=analysis_data.get('requires_browser', False),
                         requires_computation=analysis_data.get('requires_computation', False),
-                        requires_excel=analysis_data.get('requires_excel', False),
+                        requires_terminal=analysis_data.get('requires_terminal', False),
                         complexity=analysis_data.get('complexity', 'simple'),
                         domain=analysis_data.get('domain', 'general'),
                         urgency=analysis_data.get('urgency', 'normal'),
@@ -300,81 +250,22 @@ class AdvancedIntentAnalyzer:
         
         # Fallback на базовый анализ
         return self._basic_analysis(query)
-    
+
     def _basic_analysis(self, query: str) -> TaskContext:
-        """Базовый анализ намерений (fallback)."""
-        query_lower = query.lower()
-        
-        # Определяем основные намерения
-        requires_search = any(indicator in query_lower for indicator in self.search_indicators)
-        requires_browser = any(indicator in query_lower for indicator in self.browser_indicators)
-        requires_computation = any(indicator in query_lower for indicator in self.computation_indicators)
-        requires_excel = any(indicator in query_lower for indicator in self.excel_indicators)
-        
-        # Определяем сложность
-        complexity = "simple"
-        if any(word in query_lower for word in ['анализ', 'сравни', 'исследуй']):
-            complexity = "medium"
-        if any(word in query_lower for word in ['детально', 'глубокий', 'стратегия', 'план']):
-            complexity = "complex"
-        
-        # Определяем основное намерение
-        intent = "general"
-        if requires_search:
-            intent = "search"
-        elif requires_browser:
-            intent = "web_interaction"
-        elif requires_computation:
-            intent = "computation"
-        elif requires_excel:
-            intent = "excel_export"
-        
-        # Извлекаем ключевые слова
-        keywords = self._extract_keywords(query)
-        
-        # Определяем домен
-        domain = self._detect_domain(query_lower, keywords)
-        
+        """Базовый анализ намерений (fallback без эвристик)."""
         return TaskContext(
             query=query,
-            intent=intent,
-            requires_search=requires_search,
-            requires_browser=requires_browser,
-            requires_computation=requires_computation,
-            requires_excel=requires_excel,
-            complexity=complexity,
-            domain=domain,
-            keywords=keywords,
+            intent="general",
+            requires_search=False,
+            requires_browser=False,
+            requires_computation=False,
+            requires_terminal=False,
+            complexity="simple",
+            domain="general",
+            keywords=[],
             timestamp=CURRENT_DATE,
             meta_analysis={'llm_analysis': False}
         )
-    
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Извлекает ключевые слова из текста."""
-        words = re.findall(r'\b[а-яёa-z]{3,}\b', text.lower())
-        stop_words = {
-            'что', 'как', 'где', 'когда', 'почему', 'который', 'какой',
-            'это', 'для', 'или', 'при', 'под', 'над', 'без', 'про'
-        }
-        keywords = [word for word in words if word not in stop_words]
-        return list(set(keywords))[:10]
-    
-    def _detect_domain(self, query: str, keywords: List[str]) -> str:
-        """Определяет предметную область запроса."""
-        domains = {
-            'technology': ['технология', 'компьютер', 'программирование', 'ai', 'ии'],
-            'science': ['наука', 'исследование', 'эксперимент', 'теория'],
-            'business': ['бизнес', 'компания', 'экономика', 'финансы'],
-            'health': ['здоровье', 'медицина', 'лечение', 'болезнь'],
-            'education': ['образование', 'учеба', 'университет', 'курс'],
-            'finance': ['банк', 'ставка', 'процент', 'кредит', 'цб', 'рефинансирование']
-        }
-        
-        for domain, domain_keywords in domains.items():
-            if any(kw in query or kw in keywords for kw in domain_keywords):
-                return domain
-        
-        return 'general'
 
 
 class AdvancedTaskPlanner:
@@ -382,28 +273,6 @@ class AdvancedTaskPlanner:
     
     def __init__(self, gigachat_client):
         self.client = gigachat_client
-        self.base_templates = {
-            'search': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Поиск информации'},
-                {'tool': 'web_parse', 'priority': 2, 'description': 'Извлечение контента'},
-                {'tool': 'analyze_results', 'priority': 3, 'description': 'Анализ результатов'}
-            ],
-            'web_interaction': [
-                {'tool': 'browser_navigate', 'priority': 1, 'description': 'Переход на сайт'},
-                {'tool': 'wait_dynamic_content', 'priority': 2, 'description': 'Ожидание загрузки'},
-                {'tool': 'browser_extract', 'priority': 3, 'description': 'Извлечение данных'}
-            ],
-            'computation': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Поиск данных'},
-                {'tool': 'code_execute', 'priority': 2, 'description': 'Вычисления'},
-                {'tool': 'analyze_results', 'priority': 3, 'description': 'Анализ результатов'}
-            ],
-            'excel_export': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Сбор данных'},
-                {'tool': 'code_execute', 'priority': 2, 'description': 'Обработка'},
-                {'tool': 'excel_export', 'priority': 3, 'description': 'Экспорт в Excel'}
-            ]
-        }
     
     def create_smart_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает умный план выполнения с использованием LLM."""
@@ -420,15 +289,18 @@ class AdvancedTaskPlanner:
 - Временной контекст: {context.temporal_context}
 - Ключевые слова: {', '.join(context.keywords)}
 
-ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
-1. web_search - поиск в интернете
-2. web_parse - извлечение контента со страниц
-3. browser_navigate - переход на сайт в браузере
-4. browser_extract - извлечение данных из браузера
-5. browser_click - клик по элементам
-6. wait_dynamic_content - ожидание загрузки динамического контента
-7. code_execute - выполнение Python кода
-8. excel_export - экспорт в Excel
+ДОСТУПНЫЕ УНИВЕРСАЛЬНЫЕ ИНСТРУМЕНТЫ:
+1. web_search — поиск в интернете
+2. web_parse — извлечение контента со страниц
+3. browser_navigate — переход на сайт в браузере
+4. browser_extract — извлечение данных из браузера
+5. browser_click — взаимодействие с элементами
+6. wait_dynamic_content — ожидание динамического контента
+7. code_execute — выполнение сценариев и команд в изолированном окружении
+8. ls — просмотр содержимого рабочей директории
+9. read_file — чтение файлов
+10. write_file — создание файлов
+11. edit_file — изменение существующих файлов
 
 ТЕКУЩАЯ ДАТА: {CURRENT_DATE_FORMATTED}
 
@@ -443,8 +315,8 @@ class AdvancedTaskPlanner:
 2. СТРАТЕГИЯ ВЫПОЛНЕНИЯ:
    - Начинать с самых надежных источников
    - Использовать браузер для динамических сайтов
-   - Применять вычисления для анализа данных
-   - Экспортировать результаты если требуется
+   - Применять вычисления или терминал для анализа данных
+   - Фиксировать результаты в файлах при необходимости
 
 3. ОЦЕНКА РИСКОВ:
    - Что может пойти не так?
@@ -493,12 +365,7 @@ class AdvancedTaskPlanner:
                 plan_data, parse_error = self._parse_plan_response(content)
 
                 if plan_data:
-                    adapted_steps = []
-                    for step in plan_data.get('steps', []):
-                        adapted_step = self._adapt_step_to_context(step, context)
-                        adapted_steps.append(adapted_step)
-
-                    adapted_steps = self._postprocess_steps(adapted_steps, context)
+                    adapted_steps = [step.copy() for step in plan_data.get('steps', [])]
 
                     return ExecutionPlan(
                         steps=adapted_steps,
@@ -695,252 +562,35 @@ class AdvancedTaskPlanner:
 
         return ''.join(result)
 
-    def _adapt_step_to_context(self, step: Dict, context: TaskContext) -> Dict:
-        """Адаптирует шаг под конкретный контекст задачи."""
-        adapted = step.copy()
-        
-        # Добавляем специфичные для задачи параметры
-        if step['tool'] == 'web_search':
-            # Улучшаем поисковый запрос
-            if context.temporal_context == 'current':
-                adapted['query'] = f"{context.query} {CURRENT_DATE_STR}"
-            elif any(kw in context.keywords for kw in ['ставка', 'цб', 'банк']):
-                adapted['query'] = f"{context.query} ЦБ РФ сегодня"
-            else:
-                adapted['query'] = context.query
-            
-            adapted['keywords'] = context.keywords
-        
-        elif step['tool'] == 'browser_navigate':
-            # Если нужна актуальная информация, используем специальные сайты
-            if context.domain == 'finance' and any(kw in context.keywords for kw in ['ставка', 'цб']):
-                adapted['url'] = 'https://www.cbr.ru/'
-
-        return adapted
-
-    def _needs_cbr_key_rate(self, context: TaskContext) -> bool:
-        query_lower = context.query.lower()
-        keywords = {kw.lower() for kw in context.keywords}
-
-        has_rate = any(indicator in query_lower for indicator in ['ключев', 'key rate', 'keyrate']) or any(
-            ('ставк' in kw or 'ключев' in kw) for kw in keywords
-        )
-
-        has_bank = any(indicator in query_lower for indicator in ['цб', 'банк россии', 'банка россии', 'банк рф', 'банка рф', 'cbr']) or any(
-            kw in {'цб', 'банк', 'cbr', 'россии'} for kw in keywords
-        )
-
-        return has_rate and has_bank
-
-    def _extract_explicit_date(self, text: str) -> Optional[datetime]:
-        if not text:
-            return None
-
-        numeric_match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})', text)
-        if numeric_match:
-            day, month, year = numeric_match.groups()
-            year_int = int(year)
-            if year_int < 100:
-                year_int += 2000
-            try:
-                return datetime(year_int, int(month), int(day))
-            except ValueError:
-                return None
-
-        text_lower = text.lower()
-        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', text_lower)
-        if month_match:
-            if 'кварт' in month_match.group(2):
-                return None
-
-            day = int(month_match.group(1))
-            month_token = month_match.group(2)
-            year_int = int(month_match.group(3))
-
-            month_map = {
-                'янв': 1,
-                'фев': 2,
-                'мар': 3,
-                'апр': 4,
-                'май': 5,
-                'мая': 5,
-                'июн': 6,
-                'июл': 7,
-                'авг': 8,
-                'сен': 9,
-                'окт': 10,
-                'ноя': 11,
-                'дек': 12
-            }
-
-            for prefix, month_value in month_map.items():
-                if month_token.startswith(prefix):
-                    try:
-                        return datetime(year_int, month_value, day)
-                    except ValueError:
-                        return None
-
-        return None
-
-    def _extract_quarter_period(self, text: str) -> Optional[Tuple[datetime, datetime]]:
-        text_lower = text.lower()
-
-        quarter = None
-        quarter_match = re.search(r'([1-4])\s*квартал', text_lower)
-        if quarter_match:
-            quarter = int(quarter_match.group(1))
-        else:
-            roman_match = re.search(r'\b(i{1,3}|iv)\s*квартал', text_lower)
-            if roman_match:
-                roman_map = {'i': 1, 'ii': 2, 'iii': 3, 'iv': 4}
-                quarter = roman_map.get(roman_match.group(1))
-        if quarter is None and 'квартал' in text_lower:
-            word_map = {'перв': 1, 'втор': 2, 'трет': 3, 'треть': 3, 'четв': 4}
-            for prefix, value in word_map.items():
-                if prefix in text_lower:
-                    quarter = value
-                    break
-
-        year_match = re.search(r'(20\d{2})', text_lower)
-        if quarter and year_match:
-            year = int(year_match.group(1))
-            start_month_map = {1: 1, 2: 4, 3: 7, 4: 10}
-            end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-            start_dt = datetime(year, start_month_map[quarter], 1)
-            end_month, end_day = end_map[quarter]
-            end_dt = datetime(year, end_month, end_day)
-            return start_dt, end_dt
-
-        return None
-
-    def _prepare_cbr_parameters(self, context: TaskContext) -> Dict[str, Any]:
-        parameters: Dict[str, Any] = {}
-        query_text = context.query
-        query_lower = query_text.lower()
-
-        quarter_period = self._extract_quarter_period(query_text)
-        explicit_date = self._extract_explicit_date(query_text)
-
-        start_dt: Optional[datetime] = None
-        end_dt: Optional[datetime] = None
-        target_dt: Optional[datetime] = None
-
-        if quarter_period:
-            start_dt, end_dt = quarter_period
-            target_dt = end_dt
-
-        if explicit_date:
-            target_dt = explicit_date
-
-        if target_dt and start_dt and target_dt < start_dt:
-            start_dt = target_dt
-        if target_dt and end_dt and target_dt > end_dt:
-            end_dt = target_dt
-
-        if target_dt and not start_dt and not end_dt:
-            start_dt = target_dt
-            end_dt = target_dt
-
-        if start_dt:
-            parameters['start_date'] = start_dt.strftime('%d.%m.%Y')
-        if end_dt:
-            parameters['end_date'] = end_dt.strftime('%d.%m.%Y')
-        if target_dt:
-            parameters['target_date'] = target_dt.strftime('%d.%m.%Y')
-
-        parameters['return_all'] = context.requires_excel or any(
-            token in query_lower for token in ['excel', 'эксель', 'таблиц', 'сохран']
-        )
-
-        return parameters
-
-    def _build_cbr_parse_parameters(self, cbr_params: Dict[str, Any]) -> Dict[str, Any]:
-        start = cbr_params.get('start_date')
-        end = cbr_params.get('end_date')
-
-        query_params = {'UniDbQuery.Posted': 'True'}
-        if start:
-            query_params['UniDbQuery.From'] = start
-        if end:
-            query_params['UniDbQuery.To'] = end
-
-        if not start and not end:
-            return {
-                'url': 'https://www.cbr.ru/hd_base/KeyRate/',
-                'extract_focus': 'ключевая ставка; таблица; Банк России'
-            }
-
-        return {
-            'url': f"https://www.cbr.ru/hd_base/KeyRate/?{urlencode(query_params)}",
-            'extract_focus': 'ключевая ставка; таблица; Банк России'
-        }
-
-    def _postprocess_steps(self, steps: List[Dict[str, Any]], context: TaskContext) -> List[Dict[str, Any]]:
-        if not steps:
-            return steps
-
-        processed_steps = [step.copy() for step in steps]
-
-        if self._needs_cbr_key_rate(context):
-            cbr_params = self._prepare_cbr_parameters(context)
-
-            has_cbr_step = False
-            for step in processed_steps:
-                if step.get('tool') == 'cbr_key_rate':
-                    step.setdefault('description', 'Получение ключевой ставки Банка России из официального источника')
-                    step.setdefault('priority', 1)
-                    for key, value in cbr_params.items():
-                        if value is not None:
-                            step[key] = value
-                    has_cbr_step = True
-
-            if not has_cbr_step:
-                new_step = {
-                    'tool': 'cbr_key_rate',
-                    'priority': 1,
-                    'description': 'Получение ключевой ставки Банка России из официального источника'
-                }
-                for key, value in cbr_params.items():
-                    if value is not None:
-                        new_step[key] = value
-                processed_steps.insert(0, new_step)
-
-            processed_steps = [step for step in processed_steps if step.get('tool') != 'web_search']
-
-            parse_updates = self._build_cbr_parse_parameters(cbr_params)
-            for step in processed_steps:
-                if step.get('tool') == 'web_parse':
-                    step.setdefault('description', 'Извлечение таблицы ключевой ставки с cbr.ru')
-                    for key, value in parse_updates.items():
-                        if value is not None:
-                            step[key] = value
-
-        return processed_steps
-
     def _create_basic_plan(self, context: TaskContext) -> ExecutionPlan:
         """Создает базовый план (fallback)."""
-        steps = []
-        
-        # Выбираем базовый шаблон
-        if context.intent in self.base_templates:
-            base_steps = self.base_templates[context.intent].copy()
-        else:
-            base_steps = self.base_templates['search'].copy()
-        
-        # Адаптируем план под контекст
-        for step in base_steps:
-            adapted_step = self._adapt_step_to_context(step, context)
-            steps.append(adapted_step)
-        
-        # Добавляем Excel экспорт если требуется
-        if context.requires_excel:
-            steps.append({
-                'tool': 'excel_export',
-                'priority': 10,
-                'description': 'Экспорт результатов в Excel'
-            })
-
-        steps = self._postprocess_steps(steps, context)
+        steps = [
+            {
+                'tool': 'web_search',
+                'priority': 1,
+                'description': 'Собрать исходные материалы через веб-поиск',
+                'parameters': {'query': context.query},
+                'expected_outcome': 'Список релевантных источников'
+            },
+            {
+                'tool': 'browser_navigate',
+                'priority': 2,
+                'description': 'Открыть наиболее важный источник в браузере',
+                'expected_outcome': 'Загруженная страница с целевым контентом'
+            },
+            {
+                'tool': 'browser_extract',
+                'priority': 3,
+                'description': 'Извлечь ключевую информацию со страницы',
+                'expected_outcome': 'Конспект ключевых фактов'
+            },
+            {
+                'tool': 'write_file',
+                'priority': 4,
+                'description': 'Зафиксировать промежуточные результаты в заметке',
+                'expected_outcome': 'Обновленная заметка с выводами'
+            }
+        ]
 
         estimated_time = len(steps) * 5.0
 
@@ -948,18 +598,18 @@ class AdvancedTaskPlanner:
             steps=steps,
             estimated_time=estimated_time,
             confidence=0.7,
-            reasoning="Базовый план на основе шаблонов",
+            reasoning="Базовый план на основе универсальных инструментов",
             fallback_plan=self._create_fallback_plan(context),
             current_step_index=0,
             completed_steps=0,
             progress_notes=[]
         )
-    
+
     def _create_fallback_plan(self, context: TaskContext) -> List[Dict]:
         """Создает резервный план."""
         return [
-            {'tool': 'web_search', 'query': context.query, 'priority': 1},
-            {'tool': 'analyze_results', 'priority': 2}
+            {'tool': 'web_search', 'priority': 1, 'description': 'Собрать информацию по запросу'},
+            {'tool': 'browser_extract', 'priority': 2, 'description': 'Извлечь данные из открытого источника'}
         ]
 
 
@@ -2057,512 +1707,8 @@ class BrowserTool:
             )
 
 
-class CBRDataTool:
-    """Инструмент для получения ключевой ставки Банка России с официального сайта."""
-
-    MONTH_PREFIXES = {
-        'январ': 1,
-        'янв': 1,
-        'феврал': 2,
-        'фев': 2,
-        'март': 3,
-        'мар': 3,
-        'апрел': 4,
-        'апр': 4,
-        'мая': 5,
-        'май': 5,
-        'июн': 6,
-        'июл': 7,
-        'август': 8,
-        'авг': 8,
-        'сентябр': 9,
-        'сен': 9,
-        'октябр': 10,
-        'окт': 10,
-        'ноябр': 11,
-        'ноя': 11,
-        'декабр': 12,
-        'дек': 12
-    }
-
-    def __init__(self):
-        self.available = True
-        self.base_url = "https://www.cbr.ru/hd_base/KeyRate/"
-        self.logger = logging.getLogger("CBRDataTool")
-
-    def fetch_key_rate(
-        self,
-        target_date: Optional[Union[str, date, datetime]] = None,
-        start_date: Optional[Union[str, date, datetime]] = None,
-        end_date: Optional[Union[str, date, datetime]] = None,
-        return_all: Union[bool, str, int] = False
-    ) -> ToolResult:
-        """Возвращает значения ключевой ставки за указанный период."""
-
-        start_time = time.time()
-
-        if not self.available:
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=False,
-                data=None,
-                error="Инструмент получения данных ЦБ недоступен",
-                execution_time=time.time() - start_time
-            )
-
-        try:
-            normalized_start = self._parse_date_input(start_date)
-            normalized_end = self._parse_date_input(end_date)
-            normalized_target = self._parse_date_input(target_date)
-            return_all_flag = self._to_bool(return_all)
-
-            if normalized_target and not (normalized_start or normalized_end):
-                normalized_start = normalized_target
-                normalized_end = normalized_target
-
-            if normalized_start and normalized_end and normalized_start > normalized_end:
-                normalized_start, normalized_end = normalized_end, normalized_start
-
-            if normalized_target:
-                if normalized_start and normalized_target < normalized_start:
-                    normalized_start = normalized_target
-                if normalized_end and normalized_target > normalized_end:
-                    normalized_end = normalized_target
-
-            html, request_url = self._download_dataset(normalized_start, normalized_end)
-            execution_time = time.time() - start_time
-
-            if html is None:
-                return ToolResult(
-                    tool_name="cbr_key_rate",
-                    success=False,
-                    data=None,
-                    error="Не удалось загрузить данные с сайта Банка России",
-                    metadata={'request_url': request_url},
-                    execution_time=execution_time
-                )
-
-            records = self._extract_records(html)
-
-            if not records:
-                return ToolResult(
-                    tool_name="cbr_key_rate",
-                    success=False,
-                    data=None,
-                    error="На странице Банка России не найдены данные о ключевой ставке",
-                    metadata={'request_url': request_url},
-                    execution_time=execution_time
-                )
-
-            period_start_iso = normalized_start.strftime('%Y-%m-%d') if normalized_start else (records[-1]['date'] if records else None)
-            period_end_iso = normalized_end.strftime('%Y-%m-%d') if normalized_end else (records[0]['date'] if records else None)
-
-            filtered_records = records
-            if normalized_start or normalized_end:
-                filtered_records = [
-                    rec for rec in records
-                    if (not normalized_start or datetime.strptime(rec['date'], '%Y-%m-%d') >= normalized_start)
-                    and (not normalized_end or datetime.strptime(rec['date'], '%Y-%m-%d') <= normalized_end)
-                ]
-                if not filtered_records:
-                    filtered_records = records
-
-            match_record = None
-            if normalized_target:
-                match_record = self._select_record_for_date(records, normalized_target)
-            elif filtered_records:
-                match_record = filtered_records[0]
-
-            result_records = filtered_records if return_all_flag else ([match_record] if match_record else filtered_records[:1])
-
-            if not result_records:
-                result_records = records[:1]
-                match_record = result_records[0] if result_records else None
-
-            note = None
-            if normalized_target and match_record:
-                match_date = datetime.strptime(match_record['date'], '%Y-%m-%d')
-                if match_date != normalized_target:
-                    note = "Запрошенная дата отсутствует, возвращено ближайшее доступное значение"
-
-            data_payload = {
-                'records': result_records,
-                'match': match_record,
-                'target_date': normalized_target.strftime('%Y-%m-%d') if normalized_target else None,
-                'period': {
-                    'start': period_start_iso,
-                    'end': period_end_iso
-                },
-                'source_url': request_url,
-                'official_source': self.base_url,
-                'retrieved_at': CURRENT_DATE.isoformat()
-            }
-
-            if note:
-                data_payload['note'] = note
-
-            metadata = {
-                'records_returned': len(result_records),
-                'records_available': len(records),
-                'request_url': request_url,
-                'start_date': period_start_iso,
-                'end_date': period_end_iso,
-                'target_date': data_payload['target_date'],
-                'source': 'Банк России (cbr.ru)'
-            }
-
-            confidence = 0.95 if match_record else 0.8
-
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=True,
-                data=data_payload,
-                metadata=metadata,
-                execution_time=execution_time,
-                confidence=confidence
-            )
-
-        except Exception as error:
-            execution_time = time.time() - start_time
-            self.logger.error("Ошибка получения ключевой ставки: %s", error)
-            return ToolResult(
-                tool_name="cbr_key_rate",
-                success=False,
-                data=None,
-                error=str(error),
-                execution_time=execution_time
-            )
-
-    def _to_bool(self, value: Union[bool, str, int, float]) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if isinstance(value, str):
-            return value.strip().lower() in {'1', 'true', 'yes', 'y', 'да', 'истина'}
-        return bool(value)
-
-    def _parse_date_input(self, value: Optional[Union[str, date, datetime]]) -> Optional[datetime]:
-        if value is None:
-            return None
-
-        if isinstance(value, datetime):
-            return value.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        if isinstance(value, date):
-            return datetime.combine(value, datetime.min.time())
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        cleaned = text.lower().replace('года', '').replace('г.', '').replace('год', '').strip()
-
-        month_match = re.search(r'(\d{1,2})\s+([а-яё]+)\s*(20\d{2})', cleaned)
-        if month_match:
-            day = int(month_match.group(1))
-            month_text = month_match.group(2)
-            year = int(month_match.group(3))
-            month = self._month_from_text(month_text)
-            if month:
-                try:
-                    return datetime(year, month, day)
-                except ValueError:
-                    return None
-
-        normalized = cleaned.replace('/', '.').replace('-', '.').replace('\u00a0', '')
-
-        for fmt in ("%d.%m.%Y", "%Y.%m.%d", "%d.%m.%y"):
-            try:
-                parsed = datetime.strptime(normalized, fmt)
-                if fmt == "%d.%m.%y" and parsed.year < 2000:
-                    parsed = parsed.replace(year=parsed.year + 2000)
-                return parsed
-            except ValueError:
-                continue
-
-        return None
-
-    def _month_from_text(self, text: str) -> Optional[int]:
-        for prefix, month in self.MONTH_PREFIXES.items():
-            if text.startswith(prefix):
-                return month
-        return None
-
-    def _download_dataset(self, start: Optional[datetime], end: Optional[datetime]) -> Tuple[Optional[str], str]:
-        params = {}
-        if start or end:
-            params['UniDbQuery.Posted'] = 'True'
-            if start:
-                params['UniDbQuery.From'] = start.strftime('%d.%m.%Y')
-            if end:
-                params['UniDbQuery.To'] = end.strftime('%d.%m.%Y')
-
-        request_url = self.base_url if not params else f"{self.base_url}?{urlencode(params)}"
-
-        try:
-            request = Request(
-                request_url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
-                }
-            )
-            with urlopen(request, timeout=30) as response:
-                html = response.read().decode('utf-8', errors='ignore')
-            return html, request_url
-        except (HTTPError, URLError) as error:
-            self.logger.error("Ошибка загрузки страницы Банка России: %s", error)
-            return None, request_url
-        except Exception as error:
-            self.logger.error("Неожиданная ошибка загрузки данных ЦБ: %s", error)
-            return None, request_url
-
-    def _extract_records(self, html: str) -> List[Dict[str, Any]]:
-        if not html:
-            return []
-
-        table_pattern = re.compile(r'<table[^>]*>(.*?)</table>', re.IGNORECASE | re.DOTALL)
-        row_pattern = re.compile(r'<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*</tr>', re.IGNORECASE | re.DOTALL)
-
-        records: List[Dict[str, Any]] = []
-        seen_dates: Set[str] = set()
-
-        for table_html in table_pattern.findall(html):
-            for date_raw, rate_raw in row_pattern.findall(table_html):
-                date_text = unescape(date_raw).strip()
-                rate_text = unescape(rate_raw).strip()
-
-                if not re.match(r'\d{2}\.\d{2}\.\d{4}', date_text):
-                    continue
-
-                try:
-                    parsed_date = datetime.strptime(date_text, '%d.%m.%Y')
-                except ValueError:
-                    continue
-
-                iso_date = parsed_date.strftime('%Y-%m-%d')
-                if iso_date in seen_dates:
-                    continue
-
-                try:
-                    rate_value = float(rate_text.replace(',', '.').replace(' ', ''))
-                except ValueError:
-                    continue
-
-                records.append({
-                    'date': iso_date,
-                    'display_date': date_text,
-                    'rate_percent': rate_value,
-                    'rate_display': rate_text,
-                    'source': self.base_url
-                })
-                seen_dates.add(iso_date)
-
-        records.sort(key=lambda item: item['date'], reverse=True)
-        return records
-
-    def _select_record_for_date(self, records: List[Dict[str, Any]], target: datetime) -> Optional[Dict[str, Any]]:
-        if not records:
-            return None
-
-        target_date = target.date()
-
-        for record in records:
-            record_date = datetime.strptime(record['date'], '%Y-%m-%d').date()
-            if record_date == target_date:
-                return record
-
-        earlier = [
-            record for record in records
-            if datetime.strptime(record['date'], '%Y-%m-%d').date() <= target_date
-        ]
-
-        if earlier:
-            return earlier[0]
-
-        return records[-1] if records else None
-
-
-class ExcelExporter:
-    """Класс для экспорта данных в Excel."""
-
-    def __init__(self):
-        self.available = EXCEL_AVAILABLE
-    
-    def export_to_excel(self, data: Any, filename: str = None, sheet_name: str = "Данные") -> ToolResult:
-        """Экспортирует данные в Excel файл."""
-        if not self.available:
-            return ToolResult(
-                tool_name="excel_export",
-                success=False,
-                data=None,
-                error="Excel поддержка недоступна. Установите: pip install openpyxl"
-            )
-        
-        try:
-            if filename is None:
-                filename = f"export_{CURRENT_DATE_STR}_{int(time.time())}.xlsx"
-            
-            if not filename.endswith('.xlsx'):
-                filename += '.xlsx'
-            
-            if EXCEL_ENGINE == 'openpyxl':
-                return self._export_with_openpyxl(data, filename, sheet_name)
-            else:
-                return self._export_with_xlsxwriter(data, filename, sheet_name)
-                
-        except Exception as e:
-            return ToolResult(
-                tool_name="excel_export",
-                success=False,
-                data=None,
-                error=str(e)
-            )
-    
-    def _export_with_openpyxl(self, data: Any, filename: str, sheet_name: str) -> ToolResult:
-        """Экспорт с использованием openpyxl."""
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.title = sheet_name
-        
-        # Настройка стилей
-        header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        
-        if isinstance(data, dict):
-            # Экспорт словаря
-            row = 1
-            for key, value in data.items():
-                ws.cell(row=row, column=1, value=str(key))
-                ws.cell(row=row, column=2, value=str(value))
-                row += 1
-            
-            # Заголовки
-            ws.cell(row=1, column=1, value="Ключ")
-            ws.cell(row=1, column=2, value="Значение")
-            ws.cell(row=1, column=1).font = header_font
-            ws.cell(row=1, column=1).fill = header_fill
-            ws.cell(row=1, column=2).font = header_font
-            ws.cell(row=1, column=2).fill = header_fill
-            
-        elif isinstance(data, list):
-            # Экспорт списка
-            for row_idx, item in enumerate(data, 1):
-                if isinstance(item, dict):
-                    # Если это список словарей
-                    if row_idx == 1:
-                        # Создаем заголовки
-                        for col_idx, key in enumerate(item.keys(), 1):
-                            cell = ws.cell(row=1, column=col_idx, value=str(key))
-                            cell.font = header_font
-                            cell.fill = header_fill
-                        row_idx = 2
-                    
-                    for col_idx, value in enumerate(item.values(), 1):
-                        ws.cell(row=row_idx, column=col_idx, value=str(value))
-                else:
-                    # Простой список
-                    ws.cell(row=row_idx, column=1, value=str(item))
-        
-        else:
-            # Простое значение
-            ws.cell(row=1, column=1, value="Данные")
-            ws.cell(row=1, column=1).font = header_font
-            ws.cell(row=1, column=1).fill = header_fill
-            ws.cell(row=2, column=1, value=str(data))
-        
-        # Автоподбор ширины колонок
-        for column in ws.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            ws.column_dimensions[column_letter].width = adjusted_width
-        
-        # Добавляем информацию о создании
-        info_sheet = wb.create_sheet("Информация")
-        info_sheet.cell(row=1, column=1, value="Дата создания")
-        info_sheet.cell(row=1, column=2, value=CURRENT_DATE_FORMATTED)
-        info_sheet.cell(row=2, column=1, value="Время создания")
-        info_sheet.cell(row=2, column=2, value=datetime.now().strftime("%H:%M:%S"))
-        
-        wb.save(filename)
-        
-        return ToolResult(
-            tool_name="excel_export",
-            success=True,
-            data=f"Данные экспортированы в {filename}",
-            metadata={
-                'filename': filename,
-                'sheet_name': sheet_name,
-                'rows_exported': len(data) if isinstance(data, (list, dict)) else 1,
-                'export_date': CURRENT_DATE_STR
-            },
-            confidence=0.9
-        )
-    
-    def _export_with_xlsxwriter(self, data: Any, filename: str, sheet_name: str) -> ToolResult:
-        """Экспорт с использованием xlsxwriter."""
-        import xlsxwriter
-        
-        workbook = xlsxwriter.Workbook(filename)
-        worksheet = workbook.add_worksheet(sheet_name)
-        
-        # Стили
-        header_format = workbook.add_format({
-            'bold': True,
-            'font_color': 'white',
-            'bg_color': '#366092'
-        })
-        
-        if isinstance(data, dict):
-            worksheet.write(0, 0, "Ключ", header_format)
-            worksheet.write(0, 1, "Значение", header_format)
-            
-            for row, (key, value) in enumerate(data.items(), 1):
-                worksheet.write(row, 0, str(key))
-                worksheet.write(row, 1, str(value))
-                
-        elif isinstance(data, list):
-            for row, item in enumerate(data):
-                if isinstance(item, dict):
-                    if row == 0:
-                        for col, key in enumerate(item.keys()):
-                            worksheet.write(0, col, str(key), header_format)
-                    for col, value in enumerate(item.values()):
-                        worksheet.write(row + 1, col, str(value))
-                else:
-                    worksheet.write(row, 0, str(item))
-        else:
-            worksheet.write(0, 0, "Данные", header_format)
-            worksheet.write(1, 0, str(data))
-        
-        workbook.close()
-        
-        return ToolResult(
-            tool_name="excel_export",
-            success=True,
-            data=f"Данные экспортированы в {filename}",
-            metadata={
-                'filename': filename,
-                'sheet_name': sheet_name,
-                'export_date': CURRENT_DATE_STR
-            },
-            confidence=0.9
-        )
-
-
 class CodeExecutor:
-    """Улучшенный исполнитель Python кода с поддержкой Excel."""
+    """Исполнитель Python кода в изолированном окружении."""
     
     def __init__(self):
         self.globals = {
@@ -2582,22 +1728,13 @@ class CodeExecutor:
             import numpy as np
             self.globals['np'] = np
         
-        # Добавляем Excel поддержку
-        if EXCEL_AVAILABLE:
-            self.excel_exporter = ExcelExporter()
-            self.globals['excel_export'] = self.excel_exporter.export_to_excel
-    
     def execute(self, code: str) -> ToolResult:
-        """Выполняет Python код с поддержкой Excel операций."""
+        """Выполняет Python код."""
         start_time = time.time()
         
         try:
             # Создаем изолированное пространство имен
             local_namespace = {}
-            
-            # Добавляем специальные функции
-            local_namespace['save_to_excel'] = self._save_to_excel
-            local_namespace['create_excel_report'] = self._create_excel_report
             
             # Перехватываем вывод
             import io
@@ -2615,11 +1752,8 @@ class CodeExecutor:
             # Извлекаем результат
             result_data = local_namespace.get('result', stdout if stdout else "Код выполнен успешно")
             
-            # Проверяем, были ли созданы Excel файлы
-            excel_files = local_namespace.get('excel_files', [])
-            
             execution_time = time.time() - start_time
-            
+
             return ToolResult(
                 tool_name="code_execute",
                 success=True,
@@ -2629,7 +1763,6 @@ class CodeExecutor:
                     'code_length': len(code),
                     'output': stdout,
                     'errors': stderr,
-                    'excel_files': excel_files,
                     'execution_date': CURRENT_DATE_STR
                 },
                 execution_time=execution_time,
@@ -2652,65 +1785,6 @@ class CodeExecutor:
                 execution_time=execution_time
             )
     
-    def _save_to_excel(self, data, filename=None, sheet_name="Данные"):
-        """Вспомогательная функция для сохранения в Excel."""
-        if EXCEL_AVAILABLE:
-            result = self.excel_exporter.export_to_excel(data, filename, sheet_name)
-            return result.data if result.success else f"Ошибка: {result.error}"
-        else:
-            return "Excel поддержка недоступна"
-    
-    def _create_excel_report(self, title, data_dict, filename=None):
-        """Создает отчет в Excel с заданным форматом."""
-        if not EXCEL_AVAILABLE:
-            return "Excel поддержка недоступна"
-        
-        try:
-            if filename is None:
-                filename = f"report_{CURRENT_DATE_STR}.xlsx"
-            
-            from openpyxl import Workbook
-            from openpyxl.styles import Font, PatternFill, Alignment
-            
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Отчет"
-            
-            # Заголовок отчета
-            ws.cell(row=1, column=1, value=title)
-            ws.cell(row=1, column=1).font = Font(size=16, bold=True)
-            
-            # Дата создания
-            ws.cell(row=2, column=1, value=f"Дата создания: {CURRENT_DATE_FORMATTED}")
-            
-            # Данные
-            row = 4
-            for section, data in data_dict.items():
-                ws.cell(row=row, column=1, value=section)
-                ws.cell(row=row, column=1).font = Font(bold=True)
-                row += 1
-                
-                if isinstance(data, dict):
-                    for key, value in data.items():
-                        ws.cell(row=row, column=1, value=f"  {key}")
-                        ws.cell(row=row, column=2, value=str(value))
-                        row += 1
-                elif isinstance(data, list):
-                    for item in data:
-                        ws.cell(row=row, column=1, value=f"  • {item}")
-                        row += 1
-                else:
-                    ws.cell(row=row, column=1, value=f"  {data}")
-                    row += 1
-                
-                row += 1  # Пустая строка между секциями
-            
-            wb.save(filename)
-            return f"Отчет сохранен в {filename}"
-
-        except Exception as e:
-            return f"Ошибка создания отчета: {e}"
-
 
 class FileSystemTools:
     """Реальные инструменты работы с файловой системой для метапамяти агента."""
@@ -3181,9 +2255,7 @@ class SmartAgent:
         self.web_search = WebSearchTool()
         self.web_parser = WebParsingTool()
         self.browser = BrowserTool()
-        self.cbr_data_tool = CBRDataTool()
         self.code_executor = CodeExecutor()
-        self.excel_exporter = ExcelExporter()
         self.file_system = FileSystemTools()
         self.metacognition = MetacognitionManager(self.file_system)
 
@@ -3302,73 +2374,20 @@ class SmartAgent:
                 }
             ])
 
-        if getattr(self, 'cbr_data_tool', None) and self.cbr_data_tool.available:
-            functions.append({
-                "name": "cbr_key_rate",
-                "description": "Получает ключевую ставку Банка России напрямую с официального сайта cbr.ru",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target_date": {
-                            "type": "string",
-                            "description": "Дата, для которой нужно найти ставку (форматы ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "start_date": {
-                            "type": "string",
-                            "description": "Начало периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "end_date": {
-                            "type": "string",
-                            "description": "Конец периода выгрузки (формат ДД.ММ.ГГГГ или YYYY-MM-DD)"
-                        },
-                        "return_all": {
-                            "type": "boolean",
-                            "description": "Возвращать весь период вместо одного значения",
-                            "default": False
-                        }
-                    }
-                }
-            })
-
         functions.append({
             "name": "code_execute",
-            "description": "Выполняет Python код для вычислений, анализа и экспорта в Excel",
+            "description": "Выполняет Python код для вычислений и автоматизации",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Python код для выполнения. Доступны функции save_to_excel() и create_excel_report()"
+                        "description": "Python код для выполнения"
                     }
                 },
                 "required": ["code"]
             }
         })
-        
-        if self.excel_exporter.available:
-            functions.append({
-                "name": "excel_export",
-                "description": "Экспортирует данные в Excel файл",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "string",
-                            "description": "Данные для экспорта в JSON формате"
-                        },
-                        "filename": {
-                            "type": "string",
-                            "description": "Имя файла (опционально)"
-                        },
-                        "sheet_name": {
-                            "type": "string",
-                            "description": "Название листа",
-                            "default": "Данные"
-                        }
-                    },
-                    "required": ["data"]
-                }
-            })
 
         # Реальные инструменты файловой системы для метакогнитивной памяти
         functions.extend([
@@ -3520,29 +2539,9 @@ class SmartAgent:
                     timeout=arguments.get("timeout", 10000)
                 )
 
-            elif function_name == "cbr_key_rate":
-                return self.cbr_data_tool.fetch_key_rate(
-                    target_date=arguments.get("target_date"),
-                    start_date=arguments.get("start_date"),
-                    end_date=arguments.get("end_date"),
-                    return_all=arguments.get("return_all", False)
-                )
-
             elif function_name == "code_execute":
                 return self.code_executor.execute(code=arguments.get("code"))
             
-            elif function_name == "excel_export":
-                try:
-                    data = json.loads(arguments.get("data"))
-                except:
-                    data = arguments.get("data")
-
-                return self.excel_exporter.export_to_excel(
-                    data=data,
-                    filename=arguments.get("filename"),
-                    sheet_name=arguments.get("sheet_name", "Данные")
-                )
-
             elif function_name == "ls":
                 return self.file_system.list_files(
                     path=arguments.get("path"),
@@ -3803,7 +2802,7 @@ class SmartAgent:
             context.requires_search,
             context.requires_browser,
             context.requires_computation,
-            context.requires_excel
+            context.requires_terminal
         ])
 
     def _should_force_tool_usage(self, context: TaskContext, plan: ExecutionPlan) -> bool:
@@ -3842,24 +2841,15 @@ class SmartAgent:
     def build_enhanced_system_prompt(self, context: TaskContext, plan: ExecutionPlan) -> str:
         """Создает улучшенный системный промпт с метаролью и я-конструкциями."""
         
-        excel_info = ""
-        if EXCEL_AVAILABLE:
-            excel_info = """
-- Я могу экспортировать данные в Excel используя excel_export или code_execute с save_to_excel()
-- У меня есть функция save_to_excel(data, filename, sheet_name) в code_execute
-- Я могу создать форматированный отчет через create_excel_report(title, data_dict, filename)"""
-
         tools_status = f"""
 МОИ ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
 🔍 Веб-поиск: {'✅ Работает' if self.web_search.available else '❌ Недоступен'}
 📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}
 🌐 Браузер: {'✅ Работает' if self.browser.available else '❌ Недоступен'}
-🏦 Официальные данные ЦБ РФ: {'✅ Работает' if self.cbr_data_tool.available else '❌ Недоступен'} (функция cbr_key_rate)
-💻 Выполнение кода: ✅ Работает
-📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}
+💻 Выполнение кода и команд: ✅ Работает
 🗂️ Файловая память: ✅ Работает (каталог: {self.file_system.base_dir})"""
 
-        plan_reasoning = plan.reasoning if plan.reasoning else "План создан на основе базовых шаблонов"
+        plan_reasoning = plan.reasoning if plan.reasoning else "План создан на основе универсальных инструментов"
 
         file_system_guidelines = f"""
 МОЯ ФАЙЛОВАЯ ПАМЯТЬ:
@@ -3901,10 +2891,9 @@ class SmartAgent:
 4. Для динамических сайтов я обязательно жду загрузки контента
 5. Я синтезирую информацию из разных источников для полного ответа
 6. Я учитываю текущую дату при поиске актуальной информации
-7. Для ключевой ставки Банка России я обязательно вызываю cbr_key_rate, получаю данные с https://www.cbr.ru/hd_base/KeyRate/ и не подставляю значения из сторонних источников{excel_info}
-8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
-9. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
-10. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
+7. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
+8. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
+9. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
 
 МОИ МЕТАКОГНИТИВНЫЕ СПОСОБНОСТИ:
 - Я анализирую свои действия и корректирую план при необходимости
@@ -4215,7 +3204,6 @@ class SmartAgent:
             'plan_completion_percent': plan_completion_percent,
             'plan_progress': plan_progress_payload,
             'plan_followed': plan_completion_percent >= 80 and plan_adherence_percent >= 60,
-            'excel_support': EXCEL_AVAILABLE,
             'llm_analysis_used': context.meta_analysis.get('llm_analysis', False),
             'analysis_reasoning': context.meta_analysis.get('reasoning', ''),
             'plan_reasoning': plan.reasoning,
@@ -4272,7 +3260,6 @@ def main():
             ("📄 Парсинг веб-страниц", trafilatura is not None),
             ("🌐 Браузер с динамическим контентом", PLAYWRIGHT_AVAILABLE),
             ("💻 Выполнение кода", True),
-            ("📊 Экспорт в Excel", EXCEL_AVAILABLE),
             ("🧮 Научные вычисления", SKLEARN_AVAILABLE),
             ("🧠 LLM анализ намерений", True),
             ("📋 Умное планирование", True)
@@ -4307,7 +3294,7 @@ def main():
         query = st.text_area(
             "Введите ваш запрос:",
             height=120,
-            placeholder="Примеры запросов:\n• Найди последние новости об искусственном интеллекте\n• Какая ключевая ставка ЦБ РФ сегодня? Создай отчет в Excel\n• Что произошло на этой неделе в мире технологий?\n• Проанализируй текущую ситуацию на рынке криптовалют\n• Какие события запланированы на сегодня в России?\n• Сравни курсы валют и экспортируй данные",
+            placeholder="Примеры запросов:\n• Найди последние новости об искусственном интеллекте\n• Как изменилась экономика России за последний месяц?\n• Что произошло на этой неделе в мире технологий?\n• Проанализируй текущую ситуацию на рынке криптовалют\n• Какие события запланированы на сегодня в России?\n• Сравни курсы валют и подготовь выводы",
             help="Агент автоматически проанализирует ваши намерения и создаст оптимальный план решения"
         )
     
@@ -4315,7 +3302,7 @@ def main():
         st.markdown("**🎯 Примеры задач:**")
         example_queries = [
             "Последние новости ИИ",
-            "Ключевая ставка ЦБ в Excel",
+            "Ключевая ставка ЦБ на текущую дату",
             "События недели в России",
             "Анализ криптовалют",
             "Курсы валют сегодня",
@@ -4372,7 +3359,7 @@ def main():
             st.markdown("---")
             st.subheader("📊 Расширенные метрики выполнения")
             
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
                 st.metric(
@@ -4410,13 +3397,6 @@ def main():
                     f"Уверенность: {result['context'].confidence_score:.1%}"
                 )
             
-            with col6:
-                st.metric(
-                    "📊 Excel поддержка",
-                    "✅ Работает" if result.get('excel_support', False) else "❌ Недоступен",
-                    f"Движок: {EXCEL_ENGINE if EXCEL_AVAILABLE else 'Нет'}"
-                )
-
             # Анализ намерений и планирование
             st.markdown("---")
             st.subheader("🧠 Интеллектуальный анализ и планирование")
@@ -4516,8 +3496,7 @@ def main():
                     needs = {
                         "Поиск информации": context.requires_search,
                         "Работа с браузером": context.requires_browser,
-                        "Вычисления": context.requires_computation,
-                        "Экспорт в Excel": context.requires_excel
+                        "Вычисления": context.requires_computation
                     }
                     st.json(needs)
                 
