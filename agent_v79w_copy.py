@@ -13,6 +13,7 @@ import string
 import logging
 import requests
 import ast
+import copy
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
@@ -2255,12 +2256,580 @@ class FileSystemTools:
         return self._resolve_path(file_path)
 
 
+class LongContextManager:
+    """Управляет длинным контекстом с сохранением сегментов и резюме на диске."""
+
+    def __init__(self, fs_tools: FileSystemTools, summarization_client: Optional[Any] = None):
+        self.fs_tools = fs_tools
+        self.client = summarization_client
+        self.encoding = fs_tools.encoding
+        self.max_context_tokens = 32000
+        self.token_trigger_ratio = 0.8
+        self.tool_call_threshold = 8
+        self.round_threshold = 6
+        self.segment_size_limit = 100 * 1024  # 100 KB
+        self.summary_excerpt_limit = 12000
+        self.reset()
+
+    def reset(self) -> None:
+        self.active = False
+        self.session_dir: Optional[str] = None
+        self.conversation_dir: Optional[Path] = None
+        self.segments_dir: Optional[Path] = None
+        self.summaries_dir: Optional[Path] = None
+        self.metadata_dir: Optional[Path] = None
+        self.current_segment_path: Optional[Path] = None
+        self.system_prompt: str = ""
+        self.original_query: str = ""
+        self.segment_index: int = 0
+        self.summary_index: int = 0
+        self.tool_calls_since_summary: int = 0
+        self.total_tool_calls: int = 0
+        self.rounds_since_summary: int = 0
+        self.messages_since_summary: int = 0
+        self.total_tokens: int = 0
+        self.tokens_since_summary: int = 0
+        self.token_history: List[Dict[str, Any]] = []
+        self.summary_sections: List[str] = []
+        self.last_summary_reason: Optional[str] = None
+        self.last_summary_text: Optional[str] = None
+        self.last_summary_at: Optional[str] = None
+        self.approx_context_tokens: int = 0
+        self.latest_summary_path: Optional[Path] = None
+
+    def prepare_session(self, session_dir: Optional[str], query: str) -> None:
+        """Инициализирует файловую структуру управления контекстом."""
+        self.reset()
+        if not session_dir:
+            return
+
+        try:
+            conversation_dir = self.fs_tools.ensure_directory(f"{session_dir}/conversation")
+            segments_dir = self.fs_tools.ensure_directory(f"{session_dir}/conversation/segments")
+            summaries_dir = self.fs_tools.ensure_directory(f"{session_dir}/conversation/summaries")
+            metadata_dir = self.fs_tools.ensure_directory(f"{session_dir}/conversation/metadata")
+        except Exception as error:
+            logger.warning(f"Не удалось подготовить директории длинного контекста: {error}")
+            self.reset()
+            return
+
+        self.session_dir = session_dir
+        self.conversation_dir = conversation_dir
+        self.segments_dir = segments_dir
+        self.summaries_dir = summaries_dir
+        self.metadata_dir = metadata_dir
+        self.original_query = query or ""
+        self.segment_index = 1
+        self.summary_index = 0
+        self.active = True
+        self._open_new_segment(reason="initial_segment")
+        self._write_token_usage()
+        self._write_state()
+        self._update_indices()
+
+    def register_system_prompt(self, prompt: str) -> None:
+        if not self.active:
+            return
+        self.system_prompt = prompt or ""
+        self._write_state()
+
+    def capture_message(
+        self,
+        message: Optional[Dict[str, Any]],
+        iteration: int,
+        extra: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Записывает сообщение в текущий сегмент и обновляет метрики."""
+        if not self.active or not message:
+            return
+
+        try:
+            self._ensure_segment_open()
+            role = str(message.get('role', 'unknown')).lower()
+            timestamp = datetime.now().isoformat()
+            iteration_label = "старт" if iteration <= 0 else f"итерация {iteration}"
+            role_map = {
+                'system': 'System',
+                'user': 'User',
+                'assistant': 'Assistant',
+                'function': 'Tool'
+            }
+            role_display = role_map.get(role, role.title())
+
+            header = f"### {role_display} · {iteration_label} · {timestamp}"
+            lines: List[str] = [header]
+            text_for_tokens = ""
+
+            if role == 'assistant':
+                content = (message.get('content') or '').strip()
+                if content:
+                    lines.append(self._shorten_text(content, 3000))
+                    text_for_tokens += content
+
+                if message.get('function_call'):
+                    func_call = message['function_call']
+                    func_name = func_call.get('name', 'unknown_function')
+                    arguments = func_call.get('arguments')
+                    if isinstance(arguments, dict):
+                        args_preview = json.dumps(arguments, ensure_ascii=False)
+                    else:
+                        args_preview = str(arguments or "")
+                    args_preview = self._shorten_text(args_preview, 300)
+                    lines.append(f"➡️ Запрос функции: {func_name}({args_preview})")
+                    text_for_tokens += json.dumps(func_call, ensure_ascii=False)
+
+                self.rounds_since_summary += 1
+
+            elif role == 'function':
+                tool_name = (extra or {}).get('tool_name') or message.get('name') or 'tool'
+                success = (extra or {}).get('success', False)
+                status_icon = '✅' if success else '⚠️'
+                header = f"### {status_icon} Tool: {tool_name} · {iteration_label} · {timestamp}"
+                lines[0] = header
+                summary = (extra or {}).get('result_summary')
+                if summary:
+                    lines.append(f"Итог: {summary}")
+                plan_note = (extra or {}).get('plan_note')
+                if plan_note:
+                    lines.append(f"Заметка плана: {plan_note}")
+                plan_status = (extra or {}).get('plan_status')
+                if plan_status:
+                    lines.append(f"Статус плана: {plan_status}")
+                plan_summary = (extra or {}).get('plan_summary')
+                if plan_summary:
+                    lines.append(f"Кратко по шагу: {plan_summary}")
+                payload = (message.get('content') or '').strip()
+                if payload:
+                    lines.append("Данные инструмента:")
+                    lines.append("```")
+                    lines.append(self._shorten_text(payload, 1200))
+                    lines.append("```")
+                    text_for_tokens += payload
+                self.tool_calls_since_summary += 1
+                self.total_tool_calls += 1
+
+            else:
+                content = (message.get('content') or '').strip()
+                if content:
+                    lines.append(self._shorten_text(content, 3000))
+                    text_for_tokens += content
+
+            if role != 'system' or iteration > 0:
+                self.messages_since_summary += 1
+
+            entry = "\n".join(lines).rstrip() + "\n\n"
+            if self.current_segment_path:
+                with self.current_segment_path.open("a", encoding=self.encoding) as segment_file:
+                    segment_file.write(entry)
+
+            if text_for_tokens:
+                self._register_token_usage(text_for_tokens, role_display.lower())
+
+        except Exception as error:
+            logger.warning(f"Не удалось сохранить сообщение в сегменте: {error}")
+
+    def evaluate(self, messages: List[Dict[str, Any]], iteration: int,
+                 adaptive_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Проверяет необходимость суммаризации и при необходимости выполняет её."""
+        if not self.active:
+            return None
+
+        try:
+            self.approx_context_tokens = self._estimate_messages_tokens(messages)
+            reason = adaptive_hint or self._detect_trigger()
+            if reason:
+                summary_event = self._create_summary(messages, reason)
+                if summary_event:
+                    self.approx_context_tokens = self._estimate_messages_tokens(summary_event['messages'])
+                    self._write_state()
+                    return summary_event
+            else:
+                self._write_state()
+        except Exception as error:
+            logger.warning(f"Не удалось выполнить оценку длинного контекста: {error}")
+
+        return None
+
+    def refresh_state(self, messages: List[Dict[str, Any]]) -> None:
+        """Обновляет служебные метрики без запуска суммаризации."""
+        if not self.active:
+            return
+        try:
+            self.approx_context_tokens = self._estimate_messages_tokens(messages)
+            self._write_state()
+        except Exception as error:
+            logger.warning(f"Не удалось обновить состояние длинного контекста: {error}")
+
+    def _detect_trigger(self) -> Optional[str]:
+        if not self.active:
+            return None
+
+        triggers: List[str] = []
+        if self.approx_context_tokens >= int(self.max_context_tokens * self.token_trigger_ratio):
+            triggers.append('context_budget')
+        if self.tool_calls_since_summary >= self.tool_call_threshold:
+            triggers.append('tool_calls')
+        if self.rounds_since_summary >= self.round_threshold:
+            triggers.append('round_limit')
+
+        try:
+            if self.current_segment_path and self.current_segment_path.exists():
+                if self.current_segment_path.stat().st_size >= self.segment_size_limit:
+                    triggers.append('segment_size')
+        except OSError:
+            pass
+
+        return triggers[0] if triggers else None
+
+    def _create_summary(self, messages: List[Dict[str, Any]], reason: str) -> Optional[Dict[str, Any]]:
+        if not self.active or not self.current_segment_path:
+            return None
+
+        summary_text = self._generate_summary(reason)
+        if not summary_text:
+            return None
+
+        self.summary_index += 1
+        summary_filename = f"summary_{self.summary_index:03d}.md"
+        summary_path = self.summaries_dir / summary_filename if self.summaries_dir else None
+
+        try:
+            if summary_path:
+                summary_path.write_text(summary_text, encoding=self.encoding)
+            latest_path = self.summaries_dir / "summary_latest.md" if self.summaries_dir else None
+            if latest_path:
+                latest_path.write_text(summary_text, encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось сохранить файл резюме: {error}")
+
+        self.latest_summary_path = summary_path
+        summary_header = (
+            f"[Резюме #{self.summary_index:03d} • {self._describe_reason(reason)} • "
+            f"{datetime.now().isoformat()}]"
+        )
+        self.summary_sections.append(f"{summary_header}\n{summary_text}")
+        self.last_summary_reason = reason
+        self.last_summary_text = summary_text
+        self.last_summary_at = datetime.now().isoformat()
+
+        self.tool_calls_since_summary = 0
+        self.rounds_since_summary = 0
+        self.messages_since_summary = 0
+        self.tokens_since_summary = 0
+        self._write_token_usage()
+
+        self._write_current_context(summary_text)
+        self._update_indices()
+
+        self.segment_index += 1
+        self._open_new_segment(reason=f"resume_after_{summary_filename}")
+        self._write_state()
+
+        new_messages = self._build_reset_messages(messages)
+        return {
+            'summary_text': summary_text,
+            'summary_file': self._relative(summary_path) if summary_path else None,
+            'summary_index': self.summary_index,
+            'reason': reason,
+            'messages': new_messages
+        }
+
+    def _build_reset_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        system_content = self.system_prompt or ""
+        if self.summary_sections:
+            system_content = system_content.rstrip() + "\n\n" + "\n\n".join(self.summary_sections)
+
+        system_message = {"role": "system", "content": system_content}
+        new_messages: List[Dict[str, Any]] = [system_message]
+
+        if self.original_query:
+            new_messages.append({"role": "user", "content": self.original_query})
+
+        tail: List[Dict[str, Any]] = []
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            role = message.get('role')
+            if role == 'system':
+                continue
+            if role == 'user' and message.get('content') == self.original_query:
+                continue
+            tail.append(copy.deepcopy(message))
+            if len(tail) >= 2:
+                break
+
+        for message in reversed(tail):
+            new_messages.append(message)
+
+        return new_messages
+
+    def _ensure_segment_open(self) -> None:
+        if not self.current_segment_path:
+            self._open_new_segment(reason="auto_open")
+
+    def _open_new_segment(self, reason: str) -> None:
+        if not self.active or not self.segments_dir:
+            return
+
+        segment_filename = f"segment_{self.segment_index:03d}.md"
+        segment_path = self.segments_dir / segment_filename
+        header_lines = [
+            f"# Segment {self.segment_index:03d}",
+            f"Создан: {datetime.now().isoformat()}"
+        ]
+        if reason:
+            header_lines.append(f"Причина старта: {reason}")
+        if self.summary_index > 0 and self.latest_summary_path:
+            header_lines.append(f"Основано на: {self.latest_summary_path.name}")
+        if self.segment_index == 1 and self.original_query:
+            header_lines.extend(["", "## Исходный запрос", self.original_query.strip()])
+        header_lines.append("")
+
+        try:
+            segment_path.write_text("\n".join(header_lines), encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось создать файл сегмента: {error}")
+            return
+
+        self.current_segment_path = segment_path
+        self._update_indices()
+
+    def _register_token_usage(self, text: str, source: str) -> int:
+        if not text:
+            return 0
+        tokens = self._estimate_tokens(text)
+        self.tokens_since_summary += tokens
+        self.total_tokens += tokens
+        self.token_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "segment": self.segment_index,
+            "source": source,
+            "tokens": tokens,
+            "total_tokens": self.total_tokens
+        })
+        if len(self.token_history) > 500:
+            self.token_history = self.token_history[-500:]
+        self._write_token_usage()
+        return tokens
+
+    def _write_token_usage(self) -> None:
+        if not self.active or not self.metadata_dir:
+            return
+        payload = {
+            "total_tokens": self.total_tokens,
+            "tokens_since_summary": self.tokens_since_summary,
+            "segment_index": self.segment_index,
+            "summary_index": self.summary_index,
+            "history": self.token_history
+        }
+        path = self.metadata_dir / "token_usage.json"
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось обновить статистику токенов: {error}")
+
+    def _write_state(self) -> None:
+        if not self.active or not self.metadata_dir:
+            return
+        state = {
+            "active": self.active,
+            "segment_index": self.segment_index,
+            "summary_index": self.summary_index,
+            "approx_context_tokens": self.approx_context_tokens,
+            "tokens_since_summary": self.tokens_since_summary,
+            "messages_since_summary": self.messages_since_summary,
+            "rounds_since_summary": self.rounds_since_summary,
+            "tool_calls_since_summary": self.tool_calls_since_summary,
+            "total_tool_calls": self.total_tool_calls,
+            "total_tokens": self.total_tokens,
+            "last_summary_reason": self.last_summary_reason,
+            "last_summary_at": self.last_summary_at,
+            "current_segment": self._relative(self.current_segment_path),
+            "latest_summary": self._relative(self.latest_summary_path),
+            "updated_at": datetime.now().isoformat()
+        }
+        path = self.metadata_dir / "current_state.json"
+        try:
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось обновить состояние длинного контекста: {error}")
+
+    def _write_current_context(self, summary_text: str) -> None:
+        if not self.active or not self.conversation_dir:
+            return
+        lines = [
+            "# Текущий контекст",
+            "",
+            "## Исходный запрос",
+            self.original_query or "",
+            "",
+            "## Последнее резюме",
+            summary_text.strip(),
+            ""
+        ]
+        if self.summary_sections:
+            lines.append("## Хронология резюме")
+            for section in self.summary_sections:
+                header_line = section.split("\n", 1)[0]
+                lines.append(f"- {header_line}")
+            lines.append("")
+        path = self.conversation_dir / "current_context.md"
+        try:
+            path.write_text("\n".join(lines), encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось обновить файл текущего контекста: {error}")
+
+    def _update_indices(self) -> None:
+        if not self.metadata_dir:
+            return
+        try:
+            if self.segments_dir:
+                segments = sorted(self.segments_dir.glob("segment_*.md"))
+                segment_names = [segment.name for segment in segments]
+                (self.metadata_dir / "segment_index.txt").write_text(
+                    "\n".join(segment_names),
+                    encoding=self.encoding
+                )
+            if self.summaries_dir:
+                summaries = sorted(self.summaries_dir.glob("summary_*.md"))
+                summary_names = [summary.name for summary in summaries]
+                (self.metadata_dir / "summary_index.txt").write_text(
+                    "\n".join(summary_names),
+                    encoding=self.encoding
+                )
+        except Exception as error:
+            logger.warning(f"Не удалось обновить индексы сегментов: {error}")
+
+    def _estimate_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        total = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get('content')
+            if content:
+                total += self._estimate_tokens(str(content))
+            func_call = message.get('function_call')
+            if func_call:
+                try:
+                    total += self._estimate_tokens(json.dumps(func_call, ensure_ascii=False))
+                except TypeError:
+                    total += self._estimate_tokens(str(func_call))
+        return total
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, math.ceil(len(text) / 4))
+
+    def _generate_summary(self, reason: str) -> str:
+        if not self.current_segment_path or not self.current_segment_path.exists():
+            return ""
+        try:
+            segment_text = self.current_segment_path.read_text(encoding=self.encoding)
+        except Exception as error:
+            logger.warning(f"Не удалось прочитать сегмент для суммаризации: {error}")
+            return ""
+
+        if not segment_text.strip():
+            return ""
+
+        excerpt = segment_text[-self.summary_excerpt_limit:]
+        prompt_parts = [
+            f"Исходный запрос: {self.original_query}",
+            f"Причина сжатия: {self._describe_reason(reason)}"
+        ]
+        if self.last_summary_text:
+            prompt_parts.append("Предыдущее резюме:\n" + self.last_summary_text)
+        prompt_parts.append("Текущий фрагмент диалога:\n" + excerpt)
+        prompt_parts.append(
+            "Сформируй структурированное резюме в формате:\n"
+            "# Резюме\n\n## Ключевая информация\n- ...\n\n"
+            "## Пробелы в информации\n- ...\n\n## Следующие шаги\n- ..."
+        )
+        user_prompt = "\n\n".join(prompt_parts)
+
+        if not self.client:
+            return self._fallback_summary(excerpt, reason)
+
+        try:
+            response = self.client.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Ты помогаешь агенту управлять длинным контекстом. Сохраняй факты и следуй шаблону резюме."
+                    },
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=800
+            )
+            if response and 'choices' in response:
+                summary = response['choices'][0]['message']['content'].strip()
+                if summary:
+                    return summary
+        except Exception as error:
+            logger.warning(f"Сбой LLM при суммаризации сегмента: {error}")
+
+        return self._fallback_summary(excerpt, reason)
+
+    def _fallback_summary(self, text: str, reason: str) -> str:
+        normalized = text.replace('\r', ' ').replace('\n', ' ')
+        sentences = re.split(r'(?<=[.!?])\s+', normalized)
+        key_points = []
+        for sentence in sentences:
+            cleaned = sentence.strip()
+            if cleaned:
+                key_points.append(f"- {self._shorten_text(cleaned, 160)}")
+            if len(key_points) >= 5:
+                break
+        if not key_points:
+            key_points = ["- Нет новых фактов в сегменте"]
+
+        summary_lines = [
+            "# Резюме",
+            "",
+            "## Ключевая информация",
+            *key_points,
+            "",
+            "## Пробелы в информации",
+            "- Требуются дополнительные данные по нерешенным вопросам",
+            "",
+            "## Следующие шаги",
+            f"- Продолжить работу после события: {self._describe_reason(reason)}"
+        ]
+        return "\n".join(summary_lines)
+
+    def _shorten_text(self, text: str, limit: int) -> str:
+        text = text.strip()
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    def _describe_reason(self, reason: str) -> str:
+        mapping = {
+            'context_budget': 'достигнут предел контекстного окна',
+            'tool_calls': 'много вызовов инструментов',
+            'round_limit': 'большое количество раундов',
+            'segment_size': 'сегмент стал слишком большим'
+        }
+        return mapping.get(reason, reason)
+
+    def _relative(self, path: Optional[Path]) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            return str(path.relative_to(self.fs_tools.base_dir))
+        except ValueError:
+            return str(path)
+
+
 class MetacognitionManager:
     """Управляет метапамятью агента через файловую систему."""
 
-    def __init__(self, fs_tools: FileSystemTools):
+    def __init__(self, fs_tools: FileSystemTools, summarization_client: Optional[Any] = None):
         self.fs_tools = fs_tools
         self.session_dir: Optional[str] = None
+        self.long_context = LongContextManager(fs_tools, summarization_client)
 
     def _safe_session_name(self, query: str) -> str:
         sanitized = re.sub(r"[^\wа-яА-ЯёЁ-]+", "_", query, flags=re.UNICODE)
@@ -2276,6 +2845,9 @@ class MetacognitionManager:
             session_dir = f"metacognition/{timestamp}_{self._safe_session_name(query)}"
             self.fs_tools.ensure_directory(session_dir)
             self.session_dir = session_dir
+
+            if hasattr(self, "long_context") and self.long_context:
+                self.long_context.prepare_session(session_dir, query)
 
             metadata = {
                 "query": query,
@@ -2364,6 +2936,8 @@ class MetacognitionManager:
                 prompt,
                 overwrite=True
             )
+            if hasattr(self, "long_context") and self.long_context:
+                self.long_context.register_system_prompt(prompt)
         except Exception as e:
             logger.warning(f"Не удалось сохранить системный промпт: {e}")
 
@@ -2674,7 +3248,7 @@ class SmartAgent:
         self.browser = BrowserTool()
         self.code_executor = CodeExecutor()
         self.file_system = FileSystemTools()
-        self.metacognition = MetacognitionManager(self.file_system)
+        self.metacognition = MetacognitionManager(self.file_system, gigachat_client)
         self.planning_tool = PlanningToolManager(self.metacognition)
 
         # Контроль попыток ленивого ответа без вызова инструментов
@@ -3512,6 +4086,51 @@ class SmartAgent:
         ]
         self.metacognition.record_system_prompt(system_prompt)
 
+        summary_reason_labels = {
+            "context_budget": "достигнут предел контекста",
+            "tool_calls": "много вызовов инструментов",
+            "round_limit": "много итераций",
+            "segment_size": "сегмент превысил лимит"
+        }
+
+        long_context = getattr(self.metacognition, "long_context", None)
+
+        def apply_summary_event(event: Optional[Dict[str, Any]], source: str) -> None:
+            nonlocal messages, functions_state_id
+            if not event:
+                return
+
+            messages = event.get('messages', messages)
+            functions_state_id = None
+
+            reason_code = event.get('reason')
+            human_reason = summary_reason_labels.get(reason_code, reason_code)
+            summary_file = event.get('summary_file')
+
+            log_parts = [f"Контекст сжат ({human_reason})"]
+            if summary_file:
+                log_parts.append(f"сохранено: {summary_file}")
+            log_parts.append(f"источник: {source}")
+            logger.info("; ".join(log_parts))
+
+            note = f"Контекст сжат ({human_reason}, {source})"
+            if summary_file:
+                note += f" → {summary_file}"
+            plan.progress_notes.append(note)
+            if len(plan.progress_notes) > 10:
+                plan.progress_notes = plan.progress_notes[-10:]
+
+            if messages and messages[0].get('role') == 'system':
+                self.metacognition.record_system_prompt(messages[0]['content'])
+
+            if long_context:
+                long_context.refresh_state(messages)
+
+        if long_context:
+            for base_message in messages:
+                long_context.capture_message(base_message, iteration=0, extra={"phase": "bootstrap"})
+            long_context.refresh_state(messages)
+
         execution_log = []
         final_answer = None
         lazy_response_attempts = 0
@@ -3556,7 +4175,9 @@ class SmartAgent:
                 if message.get('function_call'):
                     assistant_message["function_call"] = message.get('function_call')
                 messages.append(assistant_message)
-                
+                if long_context:
+                    long_context.capture_message(assistant_message, iteration=iteration + 1)
+
                 # Обрабатываем вызов функции
                 if 'function_call' in message:
                     func_call = message['function_call']
@@ -3654,6 +4275,16 @@ class SmartAgent:
                         "content": function_content
                     }
                     messages.append(function_response)
+                    if long_context:
+                        tool_extra = {
+                            "tool_name": func_name,
+                            "result_summary": progress_info.get('summary'),
+                            "success": result.success,
+                            "plan_note": progress_info.get('note'),
+                            "plan_status": progress_info.get('status'),
+                            "plan_summary": progress_info.get('summary')
+                        }
+                        long_context.capture_message(function_response, iteration=iteration + 1, extra=tool_extra)
 
                     if guardrail_message:
                         if messages and messages[0].get("role") == "system":
@@ -3665,6 +4296,9 @@ class SmartAgent:
 
                     # Проверяем на завершение задачи
                     if func_name == "finish_task" and result.success:
+                        if long_context:
+                            summary_event = long_context.evaluate(messages, iteration + 1)
+                            apply_summary_event(summary_event, source="finish_task")
                         final_answer = result.data
                         break
                 
@@ -3674,6 +4308,9 @@ class SmartAgent:
 
                     if not content:
                         logger.debug("Получен пустой ответ без вызова функции, ожидаю дальнейших действий модели")
+                        if long_context:
+                            summary_event = long_context.evaluate(messages, iteration + 1)
+                            apply_summary_event(summary_event, source="empty_reply")
                         continue
 
                     if self._should_force_tool_usage(context, plan) and not final_answer:
@@ -3711,6 +4348,9 @@ class SmartAgent:
                                 "Достигнут предел напоминаний о вызове инструментов (%s попыток)",
                                 self.lazy_response_limit
                             )
+                        if long_context:
+                            summary_event = long_context.evaluate(messages, iteration + 1)
+                            apply_summary_event(summary_event, source="reminder")
                         continue
 
                     if content and not final_answer:
@@ -3750,13 +4390,23 @@ class SmartAgent:
                         plan.progress_notes.append('Задача закрыта вызовом finish_task')
                         if len(plan.progress_notes) > 10:
                             plan.progress_notes = plan.progress_notes[-10:]
+                        if long_context:
+                            summary_event = long_context.evaluate(messages, iteration + 1)
+                            apply_summary_event(summary_event, source="forced_finish")
                         final_answer = content
                         break
-                
+
+                if long_context and not final_answer:
+                    summary_event = long_context.evaluate(messages, iteration + 1)
+                    apply_summary_event(summary_event, source="iteration")
+
             except Exception as e:
                 logger.error(f"Ошибка в итерации {iteration + 1}: {e}")
                 break
-        
+
+        if long_context:
+            long_context.refresh_state(messages)
+
         # Закрываем браузер если был открыт
         try:
             if self.browser.page:
