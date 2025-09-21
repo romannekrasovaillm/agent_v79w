@@ -1019,9 +1019,9 @@ class BrowserTool:
             )
     
     def extract_content(self, selector: str = None, wait_for_element: bool = True) -> ToolResult:
-        """Извлекает контент со страницы с улучшенной обработкой динамического контента."""
+        """Извлекает контент со страницы с адаптацией под структуру сайта."""
         start_time = time.time()
-        
+
         if not self.page:
             return ToolResult(
                 tool_name="browser_extract",
@@ -1029,64 +1029,114 @@ class BrowserTool:
                 data=None,
                 error="Браузер не запущен"
             )
-        
+
+        domain = ""
+        if self.current_url:
+            try:
+                domain = urlparse(self.current_url).netloc.lower()
+            except Exception:
+                domain = ""
+
+        extraction_metadata = {
+            'requested_selector': selector,
+            'wait_for_element': wait_for_element,
+            'url': self.current_url,
+            'domain': domain,
+            'attempts': []
+        }
+
         try:
-            # Если указан селектор, ждем его появления
+            # Подготавливаем страницу: убираем скрытые элементы и мусор
+            self._prepare_page_for_extraction()
+
             if selector and wait_for_element:
+                # Ждем появления элемента, но не прерываем процесс при ошибке
                 try:
                     self.page.wait_for_selector(selector, timeout=10000)
-                except:
-                    logger.warning(f"Селектор {selector} не найден в течение 10 секунд")
-            
+                except Exception as wait_error:
+                    logger.debug(f"Селектор {selector} не появился за отведенное время: {wait_error}")
+                    extraction_metadata['selector_wait_timeout'] = True
+
+            content = None
+            used_selector_info: Dict[str, Any] = {}
+
             if selector:
-                # Извлекаем по селектору
-                elements = self.page.query_selector_all(selector)
-                if elements:
-                    content = "\n".join([elem.text_content() for elem in elements if elem.text_content()])
-                else:
-                    content = f"Элементы с селектором '{selector}' не найдены или пусты"
-            else:
-                # Извлекаем весь видимый текст с улучшенной обработкой
-                try:
-                    # Удаляем скрытые элементы перед извлечением
-                    self.page.evaluate("""
-                        () => {
-                            const hiddenElements = document.querySelectorAll('[style*="display: none"], [style*="visibility: hidden"], .hidden');
-                            hiddenElements.forEach(el => el.remove());
+                selector_candidates = self._prepare_selector_candidates(selector, domain)
+
+                for candidate in selector_candidates:
+                    candidate_start = time.time()
+                    extracted, attempt_info = self._extract_with_candidate(candidate)
+                    attempt_info['duration'] = round(time.time() - candidate_start, 3)
+                    extraction_metadata['attempts'].append(attempt_info)
+
+                    if extracted:
+                        content = extracted
+                        used_selector_info = {
+                            'used_selector': attempt_info.get('selector'),
+                            'selector_type': attempt_info.get('type'),
+                            'matched_elements': attempt_info.get('matches'),
+                            'origin': attempt_info.get('origin')
                         }
-                    """)
-                    
-                    content = self.page.evaluate("() => document.body.innerText")
-                    
-                    # Очищаем контент от лишних пробелов и переносов
-                    content = re.sub(r'\n\s*\n', '\n', content)
-                    content = re.sub(r' +', ' ', content)
-                    
-                except Exception as e:
-                    logger.warning(f"Не удалось извлечь контент через JavaScript: {e}")
-                    content = self.page.text_content('body') or "Контент не найден"
-            
-            # Дополнительно пытаемся извлечь структурированные данные
+                        break
+
+            fallback_info = None
+            fallback_used = False
+
+            if not content:
+                fallback_used = True
+                fallback_info = self._extract_main_content(domain)
+                content = fallback_info.get('text') or "Контент не найден"
+
+            content = self._clean_extracted_text(content)
+
+            # Собираем структурированные данные для повышения полезности результата
             structured_data = self._extract_structured_data()
-            
+
             execution_time = time.time() - start_time
-            
+
+            if len(extraction_metadata['attempts']) > 20:
+                extraction_metadata['attempts'] = extraction_metadata['attempts'][:20]
+
+            fallback_metadata = None
+            if fallback_info:
+                fallback_metadata = fallback_info.copy()
+                if 'text' in fallback_metadata:
+                    fallback_metadata['text_preview'] = fallback_metadata['text'][:200]
+                    fallback_metadata.pop('text', None)
+
+            extraction_metadata.update({
+                'used_selector': used_selector_info.get('used_selector'),
+                'used_selector_type': used_selector_info.get('selector_type'),
+                'used_selector_origin': used_selector_info.get('origin'),
+                'matched_elements': used_selector_info.get('matched_elements'),
+                'fallback_used': fallback_used,
+                'fallback_details': fallback_metadata,
+                'content_length': len(content) if content else 0
+            })
+
+            # Уровень уверенности зависит от того, насколько далеко пришлось отклониться от исходного селектора
+            confidence = 0.8
+            if used_selector_info.get('origin') and used_selector_info['origin'] not in {
+                'user', 'user-prefixed', 'user-text'
+            }:
+                confidence = 0.7
+            if fallback_used:
+                confidence = 0.6 if content and content != "Контент не найден" else 0.4
+
             return ToolResult(
                 tool_name="browser_extract",
                 success=True,
                 data=content,
                 metadata={
-                    'selector': selector,
-                    'content_length': len(content),
+                    'extraction': extraction_metadata,
                     'execution_time': execution_time,
-                    'url': self.current_url,
-                    'extraction_date': CURRENT_DATE_STR,
-                    'structured_data': structured_data
+                    'structured_data': structured_data,
+                    'extraction_date': CURRENT_DATE_STR
                 },
                 execution_time=execution_time,
-                confidence=0.8
+                confidence=confidence
             )
-            
+
         except Exception as e:
             execution_time = time.time() - start_time
             logger.error(f"Ошибка извлечения контента: {e}")
@@ -1098,6 +1148,364 @@ class BrowserTool:
                 execution_time=execution_time
             )
     
+    def _prepare_page_for_extraction(self) -> None:
+        """Удаляет скрытые элементы и подготовляет страницу к извлечению."""
+        try:
+            self.page.evaluate("""
+                () => {
+                    const selectors = [
+                        '[style*="display: none" i]',
+                        '[style*="visibility: hidden" i]',
+                        '[hidden]',
+                        'script',
+                        'style',
+                        'noscript',
+                        'template'
+                    ];
+                    const elements = document.querySelectorAll(selectors.join(','));
+                    elements.forEach(el => {
+                        try {
+                            el.remove();
+                        } catch (err) {
+                            /* ignore */
+                        }
+                    });
+                }
+            """)
+        except Exception as e:
+            logger.debug(f"Не удалось подготовить страницу к извлечению: {e}")
+
+    def _clean_extracted_text(self, text: Optional[str]) -> str:
+        """Очищает текст от лишних пробелов и переносов."""
+        if not text:
+            return ""
+
+        cleaned = text.replace('\r\n', '\n')
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+        return cleaned.strip()
+
+    def _prepare_selector_candidates(self, selector: str, domain: str) -> List[Dict[str, Any]]:
+        """Создает набор кандидатов селекторов для повышения устойчивости извлечения."""
+        if not selector:
+            return []
+
+        raw_candidates = [s.strip() for s in re.split(r'\s*\|\|\s*|\n+', selector) if s.strip()]
+        if not raw_candidates:
+            raw_candidates = [selector.strip()]
+
+        candidates: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def add_candidate(value: str, selector_type: str, origin: str) -> None:
+            if not value:
+                return
+            key = (selector_type, value)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append({'value': value, 'type': selector_type, 'origin': origin})
+
+        for raw in raw_candidates:
+            normalized = raw.strip()
+            if not normalized:
+                continue
+
+            lower = normalized.lower()
+            if lower.startswith('css='):
+                add_candidate(normalized[4:].strip() or normalized[4:], 'css', 'user-prefixed')
+                continue
+
+            if lower.startswith('xpath='):
+                add_candidate(normalized[6:].strip() or normalized[6:], 'xpath', 'user-prefixed')
+                continue
+
+            if lower.startswith('text='):
+                value = normalized[5:].strip()
+                add_candidate(value, 'text', 'user-text')
+                if re.fullmatch(r'[\w\-]+', value):
+                    add_candidate(f'#{value}', 'css', 'text-as-id')
+                    add_candidate(f'.{value}', 'css', 'text-as-class')
+                continue
+
+            if lower.startswith('role='):
+                role_value = normalized.split('=', 1)[1].strip().strip("'\"")
+                add_candidate(f'[role="{role_value}"]', 'css', 'role-attribute')
+                continue
+
+            if normalized.startswith('//') or normalized.startswith('('):
+                add_candidate(normalized, 'xpath', 'user-xpath')
+                continue
+
+            add_candidate(normalized, 'css', 'user')
+
+            if re.fullmatch(r'[\w\-]+', normalized):
+                add_candidate(f'#{normalized}', 'css', 'auto-id')
+                add_candidate(f'.{normalized}', 'css', 'auto-class')
+
+            if re.fullmatch(r'[\w\s\-\.]+', normalized) and ' ' in normalized:
+                add_candidate(normalized, 'text', 'user-text-heuristic')
+
+        for domain_selector in self._get_domain_specific_selectors(domain):
+            add_candidate(domain_selector, 'css', 'domain-heuristic')
+
+        common_candidates = [
+            'main', 'article', '[role="main"]', '#main', '#content',
+            '.content', '.main-content', '.article', '.article-body',
+            '.post', '.post-content', '.entry-content', '.news-content'
+        ]
+        for common_selector in common_candidates:
+            add_candidate(common_selector, 'css', 'common-heuristic')
+
+        return candidates[:20]
+
+    def _extract_with_candidate(self, candidate: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Пробует извлечь контент с использованием конкретного кандидата."""
+        attempt_info = {
+            'selector': candidate.get('value'),
+            'type': candidate.get('type'),
+            'origin': candidate.get('origin')
+        }
+
+        try:
+            selector_type = candidate.get('type')
+            selector_value = candidate.get('value')
+
+            texts: List[str] = []
+
+            if selector_type == 'css':
+                texts = self.page.eval_on_selector_all(
+                    selector_value,
+                    "elements => elements.map(el => (el.innerText || '').trim()).filter(Boolean)"
+                )
+            elif selector_type == 'xpath':
+                texts = self.page.evaluate(
+                    """
+                    (expression) => {
+                        try {
+                            const iterator = document.evaluate(
+                                expression,
+                                document,
+                                null,
+                                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+                                null
+                            );
+                            const results = [];
+                            for (let i = 0; i < iterator.snapshotLength; i++) {
+                                const node = iterator.snapshotItem(i);
+                                if (!node) continue;
+                                const text = (node.innerText || node.textContent || '').trim();
+                                if (text) {
+                                    results.push(text);
+                                }
+                            }
+                            return results;
+                        } catch (err) {
+                            return [];
+                        }
+                    }
+                    """,
+                    selector_value
+                )
+            elif selector_type == 'text':
+                texts = self.page.evaluate(
+                    """
+                    (text) => {
+                        const needle = text ? text.trim().toLowerCase() : '';
+                        if (!needle) {
+                            return [];
+                        }
+                        const nodes = Array.from(
+                            document.querySelectorAll('p, div, span, h1, h2, h3, h4, h5, h6, li, a')
+                        );
+                        const matches = [];
+                        for (const node of nodes) {
+                            const value = (node.innerText || '').trim();
+                            if (!value) continue;
+                            if (value.toLowerCase().includes(needle)) {
+                                matches.push(value);
+                            }
+                        }
+                        return matches;
+                    }
+                    """,
+                    selector_value
+                )
+            else:
+                attempt_info['error'] = f"Неизвестный тип селектора: {selector_type}"
+                return None, attempt_info
+
+            unique_texts: List[str] = []
+            seen_texts: Set[str] = set()
+            for item in texts or []:
+                if not item:
+                    continue
+                normalized = item.strip()
+                if not normalized:
+                    continue
+                if normalized in seen_texts:
+                    continue
+                seen_texts.add(normalized)
+                unique_texts.append(normalized)
+
+            attempt_info['matches'] = len(unique_texts)
+
+            if not unique_texts:
+                return None, attempt_info
+
+            combined = "\n\n".join(unique_texts[:5])
+            attempt_info['success'] = True
+            return combined, attempt_info
+
+        except Exception as e:
+            attempt_info['error'] = str(e)[:200]
+            attempt_info.setdefault('matches', 0)
+            return None, attempt_info
+
+    def _get_domain_specific_selectors(self, domain: str) -> List[str]:
+        """Возвращает список селекторов, характерных для конкретных доменов."""
+        if not domain:
+            return []
+
+        domain = domain.lower()
+        domain_map = {
+            'wikipedia.org': ['#mw-content-text', '.mw-parser-output'],
+            'medium.com': ['article', '.pw-post-body-paragraph'],
+            'habr.com': ['.tm-article-presenter__body', '.article-formatted-body'],
+            'vc.ru': ['.content', '.article__body'],
+            'ria.ru': ['.article__body', '.article__text'],
+            'tass.ru': ['.news-content', '.article__text'],
+            'bbc.com': ['main', '.ssrcss-uf6wea-RichTextComponentWrapper'],
+            'forbes.ru': ['.article__content', '.c-article__body'],
+            'rbc.ru': ['.article__text', '.js-article__content'],
+            'lenta.ru': ['.topic-body__content', '.js-topic__content'],
+            'theguardian.com': ['main', '.article-body-commercial-selector']
+        }
+
+        selectors: List[str] = []
+        for domain_key, domain_selectors in domain_map.items():
+            if domain_key in domain:
+                selectors.extend(domain_selectors)
+
+        return selectors
+
+    def _extract_main_content(self, domain: str) -> Dict[str, Any]:
+        """Извлекает основной контент страницы с учетом общих и доменных шаблонов."""
+        candidate_selectors = self._get_domain_specific_selectors(domain)
+        common_candidates = [
+            'main', 'article', '[role="main"]', '#main', '#content',
+            '.content', '.main-content', '.article', '.article-body',
+            '.post', '.post-content', '.entry-content', '.news-content'
+        ]
+
+        for selector in common_candidates:
+            if selector not in candidate_selectors:
+                candidate_selectors.append(selector)
+
+        fallback_result = {}
+
+        try:
+            fallback_result = self.page.evaluate(
+                r"""
+                (candidates) => {
+                    if (!Array.isArray(candidates)) {
+                        candidates = [];
+                    }
+
+                    for (const candidate of candidates) {
+                        try {
+                            const element = document.querySelector(candidate);
+                            if (!element) continue;
+                            const style = window.getComputedStyle(element);
+                            if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+                                continue;
+                            }
+                            const text = (element.innerText || '').trim();
+                            if (text && text.length > 160) {
+                                return {
+                                    text,
+                                    selector: candidate,
+                                    strategy: 'candidate_selector'
+                                };
+                            }
+                        } catch (err) {
+                            continue;
+                        }
+                    }
+
+                    const blocks = Array.from(document.querySelectorAll('main, article, section, div'));
+                    let best = null;
+
+                    for (const element of blocks) {
+                        if (!element) continue;
+                        const style = window.getComputedStyle(element);
+                        if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+                            continue;
+                        }
+                        const text = (element.innerText || '').trim();
+                        if (!text || text.length < 200) {
+                            continue;
+                        }
+
+                        if (!best || text.length > best.text.length) {
+                            let descriptor = element.tagName.toLowerCase();
+                            if (element.id) {
+                                descriptor += '#' + element.id;
+                            } else if (element.className) {
+                                const className = element.className.toString().trim().split(/\s+/).filter(Boolean).slice(0, 2).join('.');
+                                if (className) {
+                                    descriptor += '.' + className;
+                                }
+                            }
+                            best = {
+                                text,
+                                selector: descriptor,
+                                strategy: 'largest_visible_block'
+                            };
+                        }
+                    }
+
+                    if (best) {
+                        return best;
+                    }
+
+                    const bodyText = (document.body ? document.body.innerText : '').trim();
+                    return {
+                        text: bodyText,
+                        selector: 'body',
+                        strategy: 'full_body'
+                    };
+                }
+                """,
+                candidate_selectors
+            ) or {}
+        except Exception as e:
+            logger.debug(f"Не удалось извлечь основной контент по кандидатам: {e}")
+
+        text = fallback_result.get('text', '') if isinstance(fallback_result, dict) else ''
+        selector_used = fallback_result.get('selector') if isinstance(fallback_result, dict) else None
+        strategy = fallback_result.get('strategy') if isinstance(fallback_result, dict) else None
+
+        if not text:
+            try:
+                text = self.page.evaluate("() => document.body ? document.body.innerText : ''")
+            except Exception:
+                text = self.page.text_content('body') or ''
+
+            text = text or ''
+            if not selector_used:
+                selector_used = 'body'
+            if not strategy:
+                strategy = 'full_body'
+
+        return {
+            'text': text,
+            'selector': selector_used,
+            'strategy': strategy,
+            'candidate_pool_size': len(candidate_selectors),
+            'candidate_preview': candidate_selectors[:10]
+        }
+
     def _extract_structured_data(self) -> Dict[str, Any]:
         """Извлекает структурированные данные со страницы."""
         try:
