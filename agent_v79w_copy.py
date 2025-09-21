@@ -3507,10 +3507,21 @@ class SmartAgent:
                             "Модель попыталась завершить задачу без инструментов (попытка %s). Отправлено напоминание.",
                             lazy_response_attempts
                         )
-                        messages.append({
-                            "role": "system",
-                            "content": reminder_message
-                        })
+
+                        reminder_block = (
+                            f"\n\n[СИСТЕМНОЕ НАПОМИНАНИЕ #{lazy_response_attempts}] "
+                            f"{reminder_message}"
+                        )
+
+                        if messages and messages[0].get("role") == "system":
+                            messages[0]["content"] = (
+                                messages[0].get("content", "") + reminder_block
+                            )
+                        else:
+                            messages.insert(0, {
+                                "role": "system",
+                                "content": reminder_message
+                            })
 
                         note_text = (
                             f"Напоминание о необходимости вызвать инструменты (попытка {lazy_response_attempts})"
