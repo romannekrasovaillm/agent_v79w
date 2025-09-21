@@ -162,6 +162,337 @@ class ToolResult:
     confidence: float = 0.8
 
 
+@dataclass
+class TodoItem:
+    """Элемент списка задач для планирования."""
+    content: str
+    status: str = "pending"
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "content": self.content,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class TodoManager:
+    """Управляет списком задач todo для планирования."""
+
+    ALLOWED_STATUSES: Set[str] = {"pending", "in_progress", "completed"}
+
+    def __init__(self):
+        self.todos: List[TodoItem] = []
+
+    def write_todos(self, todos_payload: List[Dict[str, Any]]) -> ToolResult:
+        start_time = time.time()
+
+        if not isinstance(todos_payload, list):
+            return ToolResult(
+                tool_name="write_todos",
+                success=False,
+                data=None,
+                error="Аргумент 'todos' должен быть списком задач.",
+            )
+
+        if not todos_payload:
+            self.todos = []
+            execution_time = time.time() - start_time
+            return ToolResult(
+                tool_name="write_todos",
+                success=True,
+                data=[],
+                metadata={"total_tasks": 0, "cleared": True},
+                execution_time=execution_time,
+                confidence=0.9,
+            )
+
+        new_todos: List[TodoItem] = []
+        in_progress_present = False
+
+        for raw_item in todos_payload:
+            if not isinstance(raw_item, dict) or "content" not in raw_item:
+                return ToolResult(
+                    tool_name="write_todos",
+                    success=False,
+                    data=None,
+                    error="Каждая задача должна быть объектом с полем 'content'.",
+                )
+
+            content = str(raw_item.get("content", "")).strip()
+            if not content:
+                return ToolResult(
+                    tool_name="write_todos",
+                    success=False,
+                    data=None,
+                    error="Описание задачи не может быть пустым.",
+                )
+
+            status = raw_item.get("status", "pending")
+            if status not in self.ALLOWED_STATUSES:
+                return ToolResult(
+                    tool_name="write_todos",
+                    success=False,
+                    data=None,
+                    error="Недопустимый статус задачи. Используйте pending, in_progress или completed.",
+                )
+
+            if status == "in_progress":
+                in_progress_present = True
+
+            todo_item = TodoItem(content=content, status=status)
+            new_todos.append(todo_item)
+
+        if not in_progress_present:
+            # Автоматически отмечаем первую задачу как in_progress согласно рекомендациям
+            new_todos[0].status = "in_progress"
+            new_todos[0].updated_at = datetime.now()
+
+        self.todos = new_todos
+        execution_time = time.time() - start_time
+
+        return ToolResult(
+            tool_name="write_todos",
+            success=True,
+            data=[todo.to_dict() for todo in self.todos],
+            metadata={
+                "total_tasks": len(self.todos),
+                "in_progress": sum(1 for todo in self.todos if todo.status == "in_progress"),
+                "completed": sum(1 for todo in self.todos if todo.status == "completed"),
+            },
+            execution_time=execution_time,
+            confidence=0.9,
+        )
+
+    def get_todos(self) -> List[Dict[str, Any]]:
+        return [todo.to_dict() for todo in self.todos]
+
+
+class VirtualFileSystem:
+    """Простая виртуальная файловая система в памяти агента."""
+
+    def __init__(self):
+        self.files: Dict[str, str] = {}
+
+    def list_files(self) -> List[str]:
+        return sorted(self.files.keys())
+
+    def read_file(self, file_path: str, offset: Union[int, str] = 0, limit: Union[int, str] = 2000) -> ToolResult:
+        start_time = time.time()
+
+        if not file_path:
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error="Необходимо указать имя файла для чтения.",
+            )
+
+        file_path = str(file_path)
+
+        if file_path not in self.files:
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error=f"Файл '{file_path}' не найден.",
+            )
+
+        content = self.files[file_path]
+        lines = content.splitlines()
+
+        try:
+            offset = int(offset)
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error="Параметры offset и limit должны быть целыми числами.",
+            )
+
+        if offset < 0:
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error="Параметр offset не может быть отрицательным.",
+            )
+
+        if offset >= len(lines) and lines:
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error="Offset превышает количество строк в файле.",
+            )
+
+        limit = max(limit, 1)
+        start_index = offset
+        end_index = start_index + limit
+        selected_lines = lines[start_index:end_index] if lines else []
+
+        if not selected_lines and not lines:
+            formatted_content = "[Файл пуст]"
+        else:
+            total_lines = len(lines)
+            width = max(len(str(total_lines)), 4)
+            formatted_lines = [
+                f"{(idx + 1):>{width}}⟶{line}"
+                for idx, line in enumerate(selected_lines, start=start_index)
+            ]
+            formatted_content = "\n".join(formatted_lines)
+
+        execution_time = time.time() - start_time
+        return ToolResult(
+            tool_name="read_file",
+            success=True,
+            data=formatted_content,
+            metadata={
+                "file_path": file_path,
+                "total_lines": len(lines),
+                "offset": offset,
+                "limit": limit,
+            },
+            execution_time=execution_time,
+            confidence=0.9,
+        )
+
+    def write_file(self, file_path: str, content: str) -> ToolResult:
+        start_time = time.time()
+
+        if not file_path:
+            return ToolResult(
+                tool_name="write_file",
+                success=False,
+                data=None,
+                error="Имя файла не может быть пустым.",
+            )
+
+        file_path = str(file_path)
+
+        if not isinstance(content, str):
+            return ToolResult(
+                tool_name="write_file",
+                success=False,
+                data=None,
+                error="Содержимое файла должно быть строкой.",
+            )
+
+        overwritten = file_path in self.files
+        self.files[file_path] = content
+        execution_time = time.time() - start_time
+
+        return ToolResult(
+            tool_name="write_file",
+            success=True,
+            data=f"Файл '{file_path}' {'перезаписан' if overwritten else 'создан'}.",
+            metadata={"file_path": file_path, "overwritten": overwritten},
+            execution_time=execution_time,
+            confidence=0.9,
+        )
+
+    def edit_file(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> ToolResult:
+        start_time = time.time()
+
+        if not file_path:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Имя файла не может быть пустым.",
+            )
+
+        file_path = str(file_path)
+
+        if file_path not in self.files:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error=f"Файл '{file_path}' не найден.",
+            )
+
+        content = self.files[file_path]
+
+        if old_string is None:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Параметр old_string не может быть None.",
+            )
+
+        old_string = str(old_string)
+
+        if not old_string:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Параметр old_string не может быть пустым.",
+            )
+
+        if old_string not in content:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Строка для замены не найдена в файле.",
+            )
+
+        if new_string is None:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Параметр new_string не может быть None.",
+            )
+
+        new_string = str(new_string)
+
+        occurrences = content.count(old_string)
+        if occurrences > 1 and not replace_all:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error="Строка встречается несколько раз. Уточните контекст или установите replace_all=True.",
+            )
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replaced_count = occurrences
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            replaced_count = 1
+
+        self.files[file_path] = new_content
+        execution_time = time.time() - start_time
+
+        return ToolResult(
+            tool_name="edit_file",
+            success=True,
+            data=f"Обновлен файл '{file_path}'. Заменено вхождений: {replaced_count}.",
+            metadata={
+                "file_path": file_path,
+                "replace_all": replace_all,
+                "occurrences_replaced": replaced_count,
+            },
+            execution_time=execution_time,
+            confidence=0.85,
+        )
+
 class AdvancedIntentAnalyzer:
     """Продвинутый анализатор намерений пользователя с метарассуждениями."""
     
@@ -1594,14 +1925,16 @@ class SmartAgent:
         self.client = gigachat_client
         self.intent_analyzer = AdvancedIntentAnalyzer(gigachat_client)
         self.task_planner = AdvancedTaskPlanner(gigachat_client)
-        
+
         # Инициализируем инструменты
         self.web_search = WebSearchTool()
         self.web_parser = WebParsingTool()
         self.browser = BrowserTool()
         self.code_executor = CodeExecutor()
         self.excel_exporter = ExcelExporter()
-        
+        self.todo_manager = TodoManager()
+        self.virtual_fs = VirtualFileSystem()
+
         # История выполнения
         self.execution_history = []
         
@@ -1753,7 +2086,121 @@ class SmartAgent:
                     "required": ["data"]
                 }
             })
-        
+
+        # Инструменты виртуальной файловой системы
+        functions.extend([
+            {
+                "name": "ls",
+                "description": "Возвращает список файлов в виртуальной файловой системе",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "name": "read_file",
+                "description": "Читает файл с выводом номеров строк (как cat -n)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Имя файла для чтения",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "С какой строки начать вывод (0 по умолчанию)",
+                            "default": 0,
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Сколько строк прочитать (2000 по умолчанию)",
+                            "default": 2000,
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+            },
+            {
+                "name": "write_file",
+                "description": "Создает новый файл или полностью перезаписывает существующий",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Имя файла",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Полное содержимое файла",
+                        },
+                    },
+                    "required": ["file_path", "content"],
+                },
+            },
+            {
+                "name": "edit_file",
+                "description": "Точечно изменяет существующий файл, заменяя одну строку на другую",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Имя файла",
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Текст, который нужно заменить (без номеров строк)",
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Новый текст",
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Заменить все вхождения строки",
+                            "default": False,
+                        },
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            },
+        ])
+
+        # Инструмент планирования задач
+        functions.append(
+            {
+                "name": "write_todos",
+                "description": "Создает или обновляет структурированный todo-список задач",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "description": "Полный список задач с указанием статусов",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Текст задачи",
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Статус задачи",
+                                    },
+                                },
+                                "required": ["content"],
+                            },
+                        }
+                    },
+                    "required": ["todos"],
+                },
+            }
+        )
+
         functions.append({
             "name": "finish_task",
             "description": "Завершает выполнение задачи с финальным ответом",
@@ -1811,13 +2258,53 @@ class SmartAgent:
                     data = json.loads(arguments.get("data"))
                 except:
                     data = arguments.get("data")
-                
+
                 return self.excel_exporter.export_to_excel(
                     data=data,
                     filename=arguments.get("filename"),
                     sheet_name=arguments.get("sheet_name", "Данные")
                 )
-            
+
+            elif function_name == "ls":
+                start_time = time.time()
+                files = self.virtual_fs.list_files()
+                return ToolResult(
+                    tool_name="ls",
+                    success=True,
+                    data=files,
+                    metadata={"total_files": len(files)},
+                    execution_time=time.time() - start_time,
+                    confidence=0.95,
+                )
+
+            elif function_name == "read_file":
+                return self.virtual_fs.read_file(
+                    file_path=arguments.get("file_path", ""),
+                    offset=arguments.get("offset", 0),
+                    limit=arguments.get("limit", 2000),
+                )
+
+            elif function_name == "write_file":
+                return self.virtual_fs.write_file(
+                    file_path=arguments.get("file_path", ""),
+                    content=arguments.get("content", ""),
+                )
+
+            elif function_name == "edit_file":
+                replace_all = arguments.get("replace_all", False)
+                if isinstance(replace_all, str):
+                    replace_all = replace_all.lower() == "true"
+
+                return self.virtual_fs.edit_file(
+                    file_path=arguments.get("file_path", ""),
+                    old_string=arguments.get("old_string", ""),
+                    new_string=arguments.get("new_string", ""),
+                    replace_all=replace_all,
+                )
+
+            elif function_name == "write_todos":
+                return self.todo_manager.write_todos(arguments.get("todos", []))
+
             elif function_name == "finish_task":
                 return ToolResult(
                     tool_name="finish_task",
@@ -1864,16 +2351,29 @@ class SmartAgent:
         tools_status = f"""
 МОИ ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
 🔍 Веб-поиск: {'✅ Работает' if self.web_search.available else '❌ Недоступен'}
-📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}  
+📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}
 🌐 Браузер: {'✅ Работает' if self.browser.available else '❌ Недоступен'}
 💻 Выполнение кода: ✅ Работает
-📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}"""
+📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}
+📁 Виртуальная ФС: ✅ Всегда доступна
+📝 Планирование через todo: ✅ Всегда доступно"""
 
         plan_reasoning = plan.reasoning if plan.reasoning else "План создан на основе базовых шаблонов"
-        
+
         # Исправляем строку с форматированием
         plan_steps_formatted = '\n'.join([f'{i}. {step.get("description", step["tool"])} (приоритет: {step.get("priority", "не указан")})' for i, step in enumerate(plan.steps, 1)])
-        
+
+        fs_guidelines = """РАБОТА С ВИРТУАЛЬНОЙ ФАЙЛОВОЙ СИСТЕМОЙ:
+- Перед чтением или редактированием обязательно вызывай ls() для просмотра файлов
+- Всегда используй read_file() перед edit_file() и не включай номера строк в old_string
+- Применяй write_file() для новых файлов или полной перезаписи, а для точечных правок — только edit_file()
+- Если строка встречается несколько раз, уточняй контекст или используй replace_all=True"""
+
+        planning_guidelines = """ПЛАНИРОВАНИЕ С ПОМОЩЬЮ TODO:
+- Задействуй write_todos при сложных задачах (3+ шагов) или по прямой просьбе пользователя
+- Держи хотя бы одну задачу в статусе in_progress и отмечай завершенные как completed
+- Своевременно удаляй или обновляй устаревшие пункты и избегай чрезмерно мелких задач"""
+
         return f"""Я - продвинутый интеллектуальный агент X-Master v77 Enhanced. Моя роль - эффективно решать задачи пользователей, используя доступные инструменты и глубокий анализ.
 
 МОЯ ТЕКУЩАЯ СИТУАЦИЯ:
@@ -1893,6 +2393,10 @@ class SmartAgent:
 
 Конкретные шаги:
 {plan_steps_formatted}
+
+{fs_guidelines}
+
+{planning_guidelines}
 
 Критерии успеха: {', '.join(plan.success_criteria) if plan.success_criteria else 'Полный и точный ответ пользователю'}
 
@@ -2086,7 +2590,9 @@ class SmartAgent:
             'analysis_reasoning': context.meta_analysis.get('reasoning', ''),
             'plan_reasoning': plan.reasoning,
             'quality_score': quality_score,
-            'risk_assessment': plan.risk_assessment
+            'risk_assessment': plan.risk_assessment,
+            'todos': self.todo_manager.get_todos(),
+            'virtual_files': self.virtual_fs.list_files(),
         }
 
 
@@ -2140,7 +2646,9 @@ def main():
             ("📊 Экспорт в Excel", EXCEL_AVAILABLE),
             ("🧮 Научные вычисления", SKLEARN_AVAILABLE),
             ("🧠 LLM анализ намерений", True),
-            ("📋 Умное планирование", True)
+            ("📋 Умное планирование", True),
+            ("📁 Виртуальная файловая система", True),
+            ("📝 Todo-план", True),
         ]
         
         for tool_name, available in tools_status:
@@ -2361,7 +2869,7 @@ def main():
             # Детали контекста
             with st.expander("🧠 Детальный анализ контекста", expanded=False):
                 context = result['context']
-                
+
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("**Определенные потребности:**")
@@ -2372,22 +2880,38 @@ def main():
                         "Экспорт в Excel": context.requires_excel
                     }
                     st.json(needs)
-                
+
                 with col2:
                     st.markdown("**Извлеченные ключевые слова:**")
                     if context.keywords:
                         st.write(", ".join(context.keywords))
                     else:
                         st.write("Ключевые слова не выделены")
-                
+
                 if context.meta_analysis:
                     st.markdown("**📊 Метаанализ:**")
                     st.json(context.meta_analysis)
 
+            with st.expander("📝 Текущий todo-план", expanded=False):
+                todos = result.get('todos', [])
+                if todos:
+                    for i, todo in enumerate(todos, 1):
+                        status = todo.get('status', 'pending')
+                        st.write(f"{i}. [{status}] {todo.get('content', '')}")
+                else:
+                    st.info("Список задач пуст")
+
+            with st.expander("📁 Виртуальная файловая система", expanded=False):
+                files = result.get('virtual_files', [])
+                if files:
+                    st.write("\n".join(files))
+                else:
+                    st.info("Файлы еще не созданы")
+
             # План выполнения с рисками
             with st.expander("📋 Детальный план с оценкой рисков", expanded=False):
                 plan = result['plan']
-                
+
                 col1, col2 = st.columns(2)
                 
                 with col1:
