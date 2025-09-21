@@ -3509,6 +3509,9 @@ class SmartAgent:
 
         # История выполнения
         self.execution_history = []
+
+        # Флаг, позволяющий снимать обязательное требование использования инструментов
+        self.force_tool_usage_disabled = False
         
     def get_available_functions(self) -> List[Dict]:
         """Возвращает список доступных функций."""
@@ -4133,7 +4136,81 @@ class SmartAgent:
 
     def _should_force_tool_usage(self, context: TaskContext, plan: ExecutionPlan) -> bool:
         """Нужно ли настоятельно требовать вызова инструментов вместо текстового ответа."""
+        if getattr(self, "force_tool_usage_disabled", False):
+            return False
         return self._task_requires_active_tools(context) and self._has_pending_plan_steps(plan)
+
+    def _mark_remaining_steps_skipped(self, plan: ExecutionPlan, reason: str) -> int:
+        """Помечает оставшиеся шаги плана как пропущенные."""
+        if not plan or not getattr(plan, "steps", None):
+            return 0
+
+        if not hasattr(plan, "progress") or not isinstance(plan.progress, dict):
+            plan.progress = {
+                'total_steps': len(plan.steps),
+                'completed': 0,
+                'failed': 0,
+                'unplanned_calls': 0,
+                'history': [],
+                'current_step_order': 0
+            }
+
+        skipped_steps = 0
+        timestamp = datetime.now().isoformat()
+        progress_history = plan.progress.setdefault('history', [])
+
+        for step in plan.steps:
+            if step.get('tool') == 'finish_task':
+                continue
+            status = step.get('status')
+            if status in ('completed', 'skipped'):
+                continue
+
+            step['status'] = 'skipped'
+            step.setdefault('history', []).append({
+                'success': False,
+                'summary': reason,
+                'timestamp': timestamp,
+                'status': 'skipped'
+            })
+            step['last_result_summary'] = reason
+            progress_history.append({
+                'tool': step.get('tool'),
+                'status': 'skipped',
+                'summary': reason,
+                'timestamp': timestamp,
+                'step_order': step.get('order')
+            })
+            skipped_steps += 1
+
+        if skipped_steps:
+            if len(progress_history) > 30:
+                plan.progress['history'] = progress_history[-30:]
+
+            total_completed = sum(
+                1 for step in plan.steps
+                if step.get('status') in ('completed', 'skipped')
+            )
+            plan.completed_steps = total_completed
+            plan.current_step_index = len(plan.steps)
+            plan.progress['completed'] = total_completed
+            plan.progress.setdefault('skipped', 0)
+            plan.progress['skipped'] += skipped_steps
+            plan.progress['current_step_order'] = len(plan.steps)
+
+        return skipped_steps
+
+    def _relax_tool_usage_requirement(self, plan: ExecutionPlan, reason: str) -> int:
+        """Отключает принудительное требование инструментов и фиксирует причину."""
+        if getattr(self, "force_tool_usage_disabled", False):
+            return 0
+
+        self.force_tool_usage_disabled = True
+        skipped = self._mark_remaining_steps_skipped(plan, reason)
+        plan.progress_notes.append(reason)
+        if len(plan.progress_notes) > 10:
+            plan.progress_notes = plan.progress_notes[-10:]
+        return skipped
 
     def _build_tool_usage_reminder(self, plan: ExecutionPlan, attempt: int) -> str:
         """Формирует напоминание модели о необходимости вызвать инструменты."""
@@ -4304,6 +4381,9 @@ class SmartAgent:
         logger.info(f"Начинаю обработку запроса: {query}")
         logger.info(f"Текущая дата для контекста: {CURRENT_DATE_FORMATTED}")
 
+        # Сбрасываем режим принудительного использования инструментов
+        self.force_tool_usage_disabled = False
+
         optimization = self.query_optimizer.optimize_query(query)
         optimized_query = optimization.optimized_query
         logger.info(
@@ -4468,42 +4548,65 @@ class SmartAgent:
                         logger.debug("Получен пустой ответ без вызова функции, ожидаю дальнейших действий модели")
                         continue
 
-                    if self._should_force_tool_usage(context, plan) and not final_answer:
+                    force_required = self._should_force_tool_usage(context, plan) and not final_answer
+                    if force_required:
                         lazy_response_attempts += 1
-                        reminder_message = self._build_tool_usage_reminder(plan, lazy_response_attempts)
-                        logger.warning(
-                            "Модель попыталась завершить задачу без инструментов (попытка %s). Отправлено напоминание.",
-                            lazy_response_attempts
-                        )
+                        attempt_count = lazy_response_attempts
+                        reached_limit = attempt_count >= self.lazy_response_limit
 
-                        reminder_block = (
-                            f"\n\n[СИСТЕМНОЕ НАПОМИНАНИЕ #{lazy_response_attempts}] "
-                            f"{reminder_message}"
-                        )
-
-                        if messages and messages[0].get("role") == "system":
-                            messages[0]["content"] = (
-                                messages[0].get("content", "") + reminder_block
+                        if reached_limit:
+                            relaxation_reason = (
+                                "Автоматически отключено требование инструментов: "
+                                f"получено {attempt_count} последовательных ответов без вызова функций."
                             )
-                        else:
-                            messages.insert(0, {
-                                "role": "system",
-                                "content": reminder_message
-                            })
-
-                        note_text = (
-                            f"Напоминание о необходимости вызвать инструменты (попытка {lazy_response_attempts})"
-                        )
-                        plan.progress_notes.append(note_text)
-                        if len(plan.progress_notes) > 10:
-                            plan.progress_notes = plan.progress_notes[-10:]
-
-                        if lazy_response_attempts >= self.lazy_response_limit:
                             logger.warning(
-                                "Достигнут предел напоминаний о вызове инструментов (%s попыток)",
+                                "Достигнут предел напоминаний о вызове инструментов (%s попыток). "
+                                "Переключаюсь в адаптивный режим без обязательных инструментов.",
                                 self.lazy_response_limit
                             )
-                        continue
+                            skipped_steps = self._relax_tool_usage_requirement(plan, relaxation_reason)
+                            lazy_response_attempts = 0
+                            force_required = False
+
+                            plan_progress_payload = self._build_plan_progress_payload(plan)
+                            self.metacognition.update_progress(plan_progress_payload)
+
+                            if skipped_steps:
+                                logger.warning(
+                                    "Пропущено %s незавершённых шагов плана при отключении принуждения",
+                                    skipped_steps
+                                )
+
+                        if force_required:
+                            reminder_message = self._build_tool_usage_reminder(plan, attempt_count)
+                            logger.warning(
+                                "Модель попыталась завершить задачу без инструментов (попытка %s). Отправлено напоминание.",
+                                attempt_count
+                            )
+
+                            reminder_block = (
+                                f"\n\n[СИСТЕМНОЕ НАПОМИНАНИЕ #{attempt_count}] "
+                                f"{reminder_message}"
+                            )
+
+                            if messages and messages[0].get("role") == "system":
+                                messages[0]["content"] = (
+                                    messages[0].get("content", "") + reminder_block
+                                )
+                            else:
+                                messages.insert(0, {
+                                    "role": "system",
+                                    "content": reminder_message
+                                })
+
+                            note_text = (
+                                f"Напоминание о необходимости вызвать инструменты (попытка {attempt_count})"
+                            )
+                            plan.progress_notes.append(note_text)
+                            if len(plan.progress_notes) > 10:
+                                plan.progress_notes = plan.progress_notes[-10:]
+
+                            continue
 
                     if content and not final_answer:
                         # Принудительно вызываем finish_task
