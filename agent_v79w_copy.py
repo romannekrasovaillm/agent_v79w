@@ -148,6 +148,9 @@ class ExecutionPlan:
     risk_assessment: Dict[str, str] = field(default_factory=dict)
     success_criteria: List[str] = field(default_factory=list)
     adaptability_level: str = "medium"  # low, medium, high
+    current_step_index: int = 0
+    completed_steps: int = 0
+    progress_notes: List[str] = field(default_factory=list)
     
 
 @dataclass
@@ -500,7 +503,10 @@ class AdvancedTaskPlanner:
                         risk_assessment=plan_data.get('risk_assessment', {}),
                         success_criteria=plan_data.get('success_criteria', []),
                         adaptability_level=plan_data.get('adaptability_level', 'medium'),
-                        fallback_plan=self._create_fallback_plan(context)
+                        fallback_plan=self._create_fallback_plan(context),
+                        current_step_index=0,
+                        completed_steps=0,
+                        progress_notes=[]
                     )
         
         except Exception as e:
@@ -556,13 +562,16 @@ class AdvancedTaskPlanner:
             })
         
         estimated_time = len(steps) * 5.0
-        
+
         return ExecutionPlan(
             steps=steps,
             estimated_time=estimated_time,
             confidence=0.7,
             reasoning="Базовый план на основе шаблонов",
-            fallback_plan=self._create_fallback_plan(context)
+            fallback_plan=self._create_fallback_plan(context),
+            current_step_index=0,
+            completed_steps=0,
+            progress_notes=[]
         )
     
     def _create_fallback_plan(self, context: TaskContext) -> List[Dict]:
@@ -1833,7 +1842,7 @@ class SmartAgent:
                     data=None,
                     error=f"Неизвестная функция: {function_name}"
                 )
-                
+
         except Exception as e:
             return ToolResult(
                 tool_name=function_name,
@@ -1841,7 +1850,194 @@ class SmartAgent:
                 data=None,
                 error=str(e)
             )
-    
+
+    def _initialize_plan_tracking(self, plan: ExecutionPlan) -> None:
+        """Подготавливает план к отслеживанию выполнения длинных цепочек."""
+        plan.current_step_index = 0
+        plan.completed_steps = 0
+        plan.progress_notes = []
+        plan.progress = {
+            'total_steps': len(plan.steps),
+            'completed': 0,
+            'failed': 0,
+            'unplanned_calls': 0,
+            'history': [],
+            'current_step_order': 0
+        }
+
+        for order, step in enumerate(plan.steps):
+            step['order'] = order
+            step['status'] = 'pending'
+            step['attempts'] = 0
+            step['history'] = []
+            step['last_result_summary'] = None
+
+    def _get_next_pending_step(self, plan: ExecutionPlan) -> Optional[Dict[str, Any]]:
+        """Возвращает следующий незавершенный шаг плана."""
+        for step in plan.steps:
+            if step.get('status') == 'pending':
+                return step
+        return None
+
+    def _summarize_result(self, result: ToolResult, max_length: int = 200) -> str:
+        """Создает краткую сводку по результату инструмента."""
+        status = "успешно" if result.success else f"ошибка: {result.error}"
+
+        data_preview = ""
+        if result.data:
+            data_str = str(result.data).strip()
+            if len(data_str) > max_length:
+                data_str = data_str[:max_length] + "..."
+            data_preview = f" | данные: {data_str}"
+
+        metadata_preview = ""
+        if result.metadata:
+            items = list(result.metadata.items())[:3]
+            if items:
+                metadata_pairs = ", ".join(f"{key}={value}" for key, value in items)
+                metadata_preview = f" | метаданные: {metadata_pairs}"
+
+        timing_info = ""
+        if result.execution_time:
+            timing_info = f" | время: {result.execution_time:.2f}с"
+
+        confidence_info = ""
+        if result.confidence:
+            confidence_info = f" | уверенность: {result.confidence:.0%}"
+
+        summary = f"{status}{data_preview}{metadata_preview}{timing_info}{confidence_info}".strip()
+        return summary
+
+    def _update_plan_progress(self, plan: ExecutionPlan, tool_name: str, result: ToolResult) -> Dict[str, Any]:
+        """Обновляет прогресс плана после очередного шага."""
+        if not hasattr(plan, 'progress'):
+            self._initialize_plan_tracking(plan)
+
+        progress = plan.progress
+        summary = self._summarize_result(result)
+        planned = False
+        repeated_execution = False
+        step_order = None
+
+        for step in plan.steps:
+            if step.get('tool') == tool_name and step.get('status') == 'pending':
+                planned = True
+                step_order = step.get('order')
+                step['attempts'] = step.get('attempts', 0) + 1
+                step_history = step.setdefault('history', [])
+                step_history.append({
+                    'success': result.success,
+                    'summary': summary,
+                    'timestamp': datetime.now().isoformat()
+                })
+                if len(step_history) > 10:
+                    step['history'] = step_history[-10:]
+
+                step['last_result_summary'] = summary
+
+                if result.success:
+                    step['status'] = 'completed'
+                    progress['completed'] = progress.get('completed', 0) + 1
+                    plan.completed_steps = progress['completed']
+                else:
+                    step['status'] = 'pending'
+                    step['last_error'] = result.error
+                    progress['failed'] = progress.get('failed', 0) + 1
+                break
+        else:
+            for step in plan.steps:
+                if step.get('tool') == tool_name:
+                    planned = True
+                    repeated_execution = True
+                    step_order = step.get('order')
+                    step_history = step.setdefault('history', [])
+                    step_history.append({
+                        'success': result.success,
+                        'summary': summary,
+                        'timestamp': datetime.now().isoformat(),
+                        'note': 'повторное выполнение'
+                    })
+                    if len(step_history) > 10:
+                        step['history'] = step_history[-10:]
+                    break
+
+        status_label = 'success' if result.success else 'failed'
+        progress_history = progress.setdefault('history', [])
+        progress_history.append({
+            'tool': tool_name,
+            'status': status_label if planned else 'unplanned',
+            'summary': summary,
+            'timestamp': datetime.now().isoformat(),
+            'step_order': step_order
+        })
+        if len(progress_history) > 30:
+            progress['history'] = progress_history[-30:]
+
+        note = None
+        if planned:
+            if repeated_execution:
+                note = f"Инструмент {tool_name} выполнен повторно после шага {step_order + 1 if step_order is not None else '?'}"
+            elif result.success:
+                note = f"Шаг {step_order + 1 if step_order is not None else '?'} ({tool_name}) выполнен успешно"
+            else:
+                note = f"Шаг {step_order + 1 if step_order is not None else '?'} ({tool_name}) завершился ошибкой"
+        else:
+            progress['unplanned_calls'] = progress.get('unplanned_calls', 0) + 1
+            note = f"Выполнен внеплановый инструмент {tool_name}"
+
+        if note:
+            plan.progress_notes.append(note)
+            if len(plan.progress_notes) > 10:
+                plan.progress_notes = plan.progress_notes[-10:]
+
+        next_pending = self._get_next_pending_step(plan)
+        if next_pending:
+            plan.current_step_index = next_pending.get('order', plan.current_step_index)
+            progress['current_step_order'] = plan.current_step_index
+        else:
+            plan.current_step_index = len(plan.steps)
+            progress['current_step_order'] = plan.current_step_index
+
+        plan.progress = progress
+
+        return {
+            'planned': planned,
+            'step_order': step_order,
+            'summary': summary,
+            'note': note,
+            'status': status_label if planned else 'unplanned'
+        }
+
+    def _build_plan_progress_payload(self, plan: ExecutionPlan) -> Dict[str, Any]:
+        """Формирует краткое описание прогресса плана."""
+        if not hasattr(plan, 'progress'):
+            self._initialize_plan_tracking(plan)
+
+        progress = plan.progress
+        pending_steps = []
+        for step in plan.steps:
+            if step.get('status') == 'pending':
+                pending_steps.append({
+                    'order': step.get('order'),
+                    'tool': step.get('tool'),
+                    'description': step.get('description'),
+                    'expected_outcome': step.get('expected_outcome')
+                })
+
+        next_step = pending_steps[0] if pending_steps else None
+
+        return {
+            'total_steps': progress.get('total_steps', len(plan.steps)),
+            'completed_steps': progress.get('completed', plan.completed_steps),
+            'failed_attempts': progress.get('failed', 0),
+            'unplanned_calls': progress.get('unplanned_calls', 0),
+            'current_step_order': progress.get('current_step_order', plan.current_step_index),
+            'next_step': next_step,
+            'pending_steps': pending_steps[:5],
+            'recent_history': progress.get('history', [])[-5:],
+            'recent_notes': plan.progress_notes[-5:] if plan.progress_notes else []
+        }
+
     def _format_plan_steps(self, steps):
         """Форматирует шаги плана в читаемый вид."""
         formatted_steps = []
@@ -1905,12 +2101,18 @@ class SmartAgent:
 6. Я учитываю текущую дату при поиске актуальной информации
 7. Для финансовых данных я использую браузер для работы с официальными сайтами{excel_info}
 8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
+9. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
 
 МОИ МЕТАКОГНИТИВНЫЕ СПОСОБНОСТИ:
 - Я анализирую свои действия и корректирую план при необходимости
 - Я понимаю ограничения своих инструментов и адаптируюсь
 - Я оцениваю качество получаемых данных и ищу дополнительные источники
 - Я помню контекст всего диалога и использую накопленную информацию
+
+МОЙ МОНИТОРИНГ ПРОГРЕССА:
+- Я фиксирую статус каждого шага плана и отмечаю завершенные инструменты
+- После каждого шага я напоминаю себе, какой инструмент идет следующим
+- Для длинных последовательностей я регулярно сверяюсь с планом и избегаю пропусков
 
 СТРАТЕГИЯ РАБОТЫ С ВРЕМЕННЫМИ ДАННЫМИ:
 Поскольку сегодня {CURRENT_DATE_FORMATTED}, я:
@@ -1934,19 +2136,26 @@ class SmartAgent:
         plan = self.task_planner.create_smart_plan(context)
         logger.info(f"Создан план: {[step['tool'] for step in plan.steps]}")
         logger.info(f"Обоснование плана: {plan.reasoning}")
-        
+
+        # Подготавливаем план к отслеживанию длительных цепочек
+        self._initialize_plan_tracking(plan)
+
         # Инициализируем диалог с улучшенным промптом
         messages = [
             {"role": "system", "content": self.build_enhanced_system_prompt(context, plan)},
             {"role": "user", "content": query}
         ]
-        
+
         execution_log = []
         final_answer = None
-        
-        for iteration in range(max_iterations):
+
+        iteration_limit = max(max_iterations, len(plan.steps) * 2 if plan.steps else max_iterations)
+        if iteration_limit != max_iterations:
+            logger.info(f"Увеличен лимит итераций до {iteration_limit} для длинной цепочки инструментов")
+
+        for iteration in range(iteration_limit):
             try:
-                logger.info(f"Итерация {iteration + 1}/{max_iterations}")
+                logger.info(f"Итерация {iteration + 1}/{iteration_limit}")
                 
                 # Отправляем запрос в GigaChat
                 response = self.client.chat(
@@ -1986,15 +2195,27 @@ class SmartAgent:
                     
                     logger.info(f"Выполняется функция: {func_name} с аргументами: {func_args}")
                     
-                    # Выполняем функцию
+                    # Выполняем функцию и обновляем прогресс плана
                     result = self.execute_function(func_name, func_args)
+                    progress_info = self._update_plan_progress(plan, func_name, result)
+                    plan_progress_payload = self._build_plan_progress_payload(plan)
+
                     execution_log.append({
                         'function': func_name,
                         'arguments': func_args,
                         'result': result,
                         'iteration': iteration + 1,
                         'timestamp': datetime.now().isoformat(),
-                        'planned': func_name in [step['tool'] for step in plan.steps]
+                        'planned': progress_info.get('planned', False),
+                        'plan_step_order': progress_info.get('step_order'),
+                        'plan_status': progress_info.get('status'),
+                        'plan_note': progress_info.get('note'),
+                        'plan_summary': progress_info.get('summary'),
+                        'plan_state': {
+                            'completed_steps': plan_progress_payload.get('completed_steps'),
+                            'pending_steps': len(plan_progress_payload.get('pending_steps', [])),
+                            'next_tool': plan_progress_payload.get('next_step', {}).get('tool') if plan_progress_payload.get('next_step') else None
+                        }
                     })
                     
                     # Проверяем на завершение задачи
@@ -2012,7 +2233,10 @@ class SmartAgent:
                             "error": result.error,
                             "metadata": result.metadata,
                             "confidence": result.confidence,
-                            "execution_time": result.execution_time
+                            "execution_time": result.execution_time,
+                            "plan_progress": plan_progress_payload,
+                            "plan_note": progress_info.get('note'),
+                            "plan_summary": progress_info.get('summary')
                         }, ensure_ascii=False)
                     }
                     messages.append(function_response)
@@ -2023,14 +2247,26 @@ class SmartAgent:
                     if content and not final_answer:
                         # Принудительно вызываем finish_task
                         result = self.execute_function("finish_task", {"answer": content})
+                        plan_progress_payload = self._build_plan_progress_payload(plan)
                         execution_log.append({
                             'function': 'finish_task',
                             'arguments': {"answer": content},
                             'result': result,
                             'iteration': iteration + 1,
                             'timestamp': datetime.now().isoformat(),
-                            'planned': True
+                            'planned': True,
+                            'plan_status': 'completion',
+                            'plan_note': 'Завершение задачи финальным ответом',
+                            'plan_summary': 'finish_task',
+                            'plan_state': {
+                                'completed_steps': plan_progress_payload.get('completed_steps'),
+                                'pending_steps': len(plan_progress_payload.get('pending_steps', [])),
+                                'next_tool': None
+                            }
                         })
+                        plan.progress_notes.append('Задача закрыта вызовом finish_task')
+                        if len(plan.progress_notes) > 10:
+                            plan.progress_notes = plan.progress_notes[-10:]
                         final_answer = content
                         break
                 
@@ -2052,27 +2288,38 @@ class SmartAgent:
         # Получаем списки инструментов
         planned_tools = [step['tool'] for step in plan.steps]
         executed_tools = [log['function'] for log in execution_log]
-        
+
         # Анализируем следование плану
         plan_adherence = sum(1 for log in execution_log if log.get('planned', False))
         plan_adherence_percent = (plan_adherence / max(total_tools, 1)) * 100
-        
+        plan_completion_percent = (plan.completed_steps / len(plan.steps) * 100) if plan.steps else 100.0
+        plan_progress_payload = self._build_plan_progress_payload(plan)
+
+        # Сохраняем историю выполнения
+        self.execution_history = execution_log
+
+        # Количество итераций, которые фактически были использованы
+        iterations_used = (iteration + 1) if 'iteration' in locals() else 0
+
         # Оцениваем качество выполнения
         quality_score = 0.0
         if final_answer:
             quality_score += 0.4  # Есть финальный ответ
         if successful_tools > 0:
             quality_score += 0.3 * (successful_tools / max(total_tools, 1))  # Успешность инструментов
-        if plan_adherence_percent > 50:
+        if plan.steps:
+            completion_ratio = min(1.0, plan.completed_steps / max(len(plan.steps), 1))
+            quality_score += 0.3 * completion_ratio
+        elif plan_adherence_percent > 50:
             quality_score += 0.3  # Следование плану
-        
+
         return {
             'success': final_answer is not None,
             'final_answer': final_answer or "Не удалось получить ответ",
             'context': context,
             'plan': plan,
             'execution_log': execution_log,
-            'total_iterations': iteration + 1,
+            'total_iterations': iterations_used,
             'tools_used': total_tools,
             'successful_tools': successful_tools,
             'confidence': quality_score,
@@ -2080,13 +2327,16 @@ class SmartAgent:
             'planned_tools': planned_tools,
             'executed_tools': executed_tools,
             'plan_adherence_percent': plan_adherence_percent,
-            'plan_followed': plan_adherence_percent > 70,
+            'plan_completion_percent': plan_completion_percent,
+            'plan_progress': plan_progress_payload,
+            'plan_followed': plan_completion_percent >= 80 and plan_adherence_percent >= 60,
             'excel_support': EXCEL_AVAILABLE,
             'llm_analysis_used': context.meta_analysis.get('llm_analysis', False),
             'analysis_reasoning': context.meta_analysis.get('reasoning', ''),
             'plan_reasoning': plan.reasoning,
             'quality_score': quality_score,
-            'risk_assessment': plan.risk_assessment
+            'risk_assessment': plan.risk_assessment,
+            'iteration_limit': iteration_limit
         }
 
 
@@ -2250,7 +2500,7 @@ def main():
                 st.metric(
                     "🔄 Итераций",
                     result['total_iterations'],
-                    f"Лимит: {max_iterations}"
+                    f"Лимит: {result.get('iteration_limit', max_iterations)}"
                 )
             
             with col3:
@@ -2263,8 +2513,8 @@ def main():
             with col4:
                 st.metric(
                     "📋 Следование плану",
-                    f"{result.get('plan_adherence_percent', 0):.0f}%",
-                    "✅ Хорошо" if result.get('plan_followed', False) else "⚠️ Частично"
+                    f"{result.get('plan_completion_percent', 0):.0f}%",
+                    f"Согласование: {result.get('plan_adherence_percent', 0):.0f}%"
                 )
             
             with col5:
@@ -2331,7 +2581,20 @@ def main():
             if result.get('planned_tools') and result.get('executed_tools'):
                 st.markdown("---")
                 st.subheader("📋 Выполнение плана vs. Реальность")
-                
+
+                plan_progress = result.get('plan_progress', {})
+                if plan_progress:
+                    progress_summary = f"{plan_progress.get('completed_steps', 0)}/{plan_progress.get('total_steps', 0)} шагов завершено"
+                    next_tool = plan_progress.get('next_step', {}).get('tool') if plan_progress.get('next_step') else None
+                    if next_tool:
+                        progress_summary += f", следующий инструмент: {next_tool}"
+                    st.info(f"📈 Прогресс плана: {progress_summary}")
+
+                    if plan_progress.get('recent_notes'):
+                        with st.expander("🧠 Последние заметки плана", expanded=False):
+                            for note in plan_progress['recent_notes']:
+                                st.write(f"- {note}")
+
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
@@ -2416,6 +2679,7 @@ def main():
             # Детальный лог выполнения
             with st.expander("📜 Детальный лог выполнения", expanded=False):
                 if result['execution_log']:
+                    plan_total_steps = result.get('plan_progress', {}).get('total_steps', len(result.get('planned_tools', [])))
                     for i, log_entry in enumerate(result['execution_log'], 1):
                         func_result = log_entry['result']
                         
@@ -2454,7 +2718,19 @@ def main():
                         if func_result.metadata:
                             st.markdown("**🔍 Метаданные:**")
                             st.json(func_result.metadata)
-                        
+
+                        if log_entry.get('plan_note'):
+                            st.caption(f"📈 План: {log_entry['plan_note']}")
+
+                        if log_entry.get('plan_state'):
+                            completed = log_entry['plan_state'].get('completed_steps', 0)
+                            pending = log_entry['plan_state'].get('pending_steps', 0)
+                            next_tool = log_entry['plan_state'].get('next_tool')
+                            plan_state_text = f"{completed}/{plan_total_steps} шагов выполнено, осталось {pending}"
+                            if next_tool:
+                                plan_state_text += f", следующий инструмент: {next_tool}"
+                            st.caption(f"🧭 Прогресс плана: {plan_state_text}")
+
                         st.markdown("---")
                 else:
                     st.info("Функции не вызывались")
