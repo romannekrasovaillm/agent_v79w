@@ -4034,7 +4034,7 @@ class SmartAgent:
 
 Теперь я приступаю к выполнению задачи с полной концентрацией и профессионализмом!"""
     
-    def process_query(self, query: str, max_iterations: int = 15) -> Dict[str, Any]:
+    def process_query(self, query: str, max_iterations: int = 50) -> Dict[str, Any]:
         """Обрабатывает запрос пользователя с улучшенным анализом."""
         logger.info(f"Начинаю обработку запроса: {query}")
         logger.info(f"Текущая дата для контекста: {CURRENT_DATE_FORMATTED}")
@@ -4531,8 +4531,8 @@ def main():
         max_iterations = st.slider(
             "Максимум итераций",
             min_value=5,
-            max_value=20,
-            value=15,
+            max_value=50,
+            value=50,
             help="Максимальное количество шагов для решения задачи"
         )
         
