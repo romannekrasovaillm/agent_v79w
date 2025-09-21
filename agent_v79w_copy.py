@@ -20,9 +20,10 @@ import trafilatura
 from datetime import datetime, date
 from io import BytesIO
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import List, Dict, Any, Optional, Tuple, Union, Callable, Set
+from pathlib import Path
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1270,7 +1271,7 @@ class BrowserTool:
 
 class ExcelExporter:
     """Класс для экспорта данных в Excel."""
-    
+
     def __init__(self):
         self.available = EXCEL_AVAILABLE
     
@@ -1591,14 +1592,468 @@ class CodeExecutor:
             
             wb.save(filename)
             return f"Отчет сохранен в {filename}"
-            
+
         except Exception as e:
             return f"Ошибка создания отчета: {e}"
 
 
+class FileSystemTools:
+    """Реальные инструменты работы с файловой системой для метапамяти агента."""
+
+    def __init__(self, base_dir: Optional[Union[str, Path]] = None, encoding: str = "utf-8"):
+        self.base_dir = Path(base_dir) if base_dir else Path.cwd() / "agent_workspace"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.encoding = encoding
+
+    def _resolve_path(self, file_path: Optional[Union[str, Path]]) -> Path:
+        if file_path in (None, "", "."):
+            return self.base_dir
+
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            path = self.base_dir / path
+
+        resolved = path.resolve()
+        base_resolved = self.base_dir.resolve()
+        if not resolved.is_relative_to(base_resolved):
+            raise ValueError("Доступ к файлам вне рабочей директории запрещен")
+
+        return resolved
+
+    def _relative_path(self, path: Path) -> str:
+        try:
+            relative = path.relative_to(self.base_dir)
+            return "." if str(relative) == "." else str(relative)
+        except ValueError:
+            return str(path)
+
+    def _describe_path(self, path: Path) -> Dict[str, Any]:
+        info = {
+            "name": path.name,
+            "path": self._relative_path(path),
+            "type": "directory" if path.is_dir() else "file"
+        }
+        try:
+            stats = path.stat()
+            info["size"] = stats.st_size
+            info["modified"] = datetime.fromtimestamp(stats.st_mtime).isoformat()
+        except OSError:
+            info["size"] = None
+            info["modified"] = None
+        return info
+
+    def list_files(self, path: Optional[str] = None, recursive: bool = False,
+                   include_hidden: bool = False) -> ToolResult:
+        """Возвращает список файлов и директорий в рабочем пространстве."""
+        try:
+            target = self._resolve_path(path)
+
+            if target.exists() and target.is_file():
+                description = self._describe_path(target)
+                return ToolResult(
+                    tool_name="ls",
+                    success=True,
+                    data=[description["path"]],
+                    metadata={
+                        "base_directory": str(self.base_dir),
+                        "entries": [description],
+                        "target": description["path"],
+                        "recursive": False
+                    }
+                )
+
+            if not target.exists():
+                return ToolResult(
+                    tool_name="ls",
+                    success=False,
+                    data=None,
+                    error="Указанный каталог не найден"
+                )
+
+            if not target.is_dir():
+                return ToolResult(
+                    tool_name="ls",
+                    success=False,
+                    data=None,
+                    error="Путь не является директорией"
+                )
+
+            if recursive:
+                entries_iter = target.rglob("*")
+            else:
+                entries_iter = target.iterdir()
+
+            entries = []
+            simple_listing = []
+            for entry in sorted(entries_iter, key=lambda p: str(self._relative_path(p)).lower()):
+                relative_path = self._relative_path(entry)
+                if not include_hidden:
+                    parts = Path(relative_path).parts if relative_path not in ("", ".") else ()
+                    if any(part.startswith('.') for part in parts):
+                        continue
+                description = self._describe_path(entry)
+                entries.append(description)
+                simple_listing.append(description["path"])
+
+            return ToolResult(
+                tool_name="ls",
+                success=True,
+                data=simple_listing,
+                metadata={
+                    "base_directory": str(self.base_dir),
+                    "entries": entries,
+                    "target": self._relative_path(target),
+                    "recursive": recursive
+                }
+            )
+
+        except Exception as e:
+            return ToolResult(
+                tool_name="ls",
+                success=False,
+                data=None,
+                error=str(e)
+            )
+
+    def read_file(self, file_path: str, offset: int = 0, limit: int = 2000) -> ToolResult:
+        """Читает файл и возвращает его содержимое с номерами строк."""
+        try:
+            path = self._resolve_path(file_path)
+            if not path.exists() or not path.is_file():
+                return ToolResult(
+                    tool_name="read_file",
+                    success=False,
+                    data=None,
+                    error="Файл не найден"
+                )
+
+            with path.open("r", encoding=self.encoding) as f:
+                lines = f.readlines()
+
+            total_lines = len(lines)
+            start = max(offset, 0)
+            end = total_lines if limit is None else min(total_lines, start + max(limit, 0))
+
+            sliced_lines = lines[start:end]
+            if not sliced_lines and total_lines == 0:
+                content = "Файл пуст"
+            else:
+                numbered = [f"{idx:>6}⟶{line.rstrip('\n')}" for idx, line in enumerate(sliced_lines, start=start + 1)]
+                content = "\n".join(numbered)
+
+            return ToolResult(
+                tool_name="read_file",
+                success=True,
+                data=content,
+                metadata={
+                    "path": self._relative_path(path),
+                    "total_lines": total_lines,
+                    "offset": start,
+                    "limit": limit,
+                    "lines_returned": len(sliced_lines)
+                }
+            )
+
+        except Exception as e:
+            return ToolResult(
+                tool_name="read_file",
+                success=False,
+                data=None,
+                error=str(e)
+            )
+
+    def write_file(self, file_path: str, content: str, overwrite: bool = False) -> ToolResult:
+        """Создает или перезаписывает файл."""
+        try:
+            path = self._resolve_path(file_path)
+            if path.exists() and not overwrite:
+                return ToolResult(
+                    tool_name="write_file",
+                    success=False,
+                    data=None,
+                    error="Файл уже существует. Укажите overwrite=True для перезаписи"
+                )
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text_content = "" if content is None else str(content)
+            path.write_text(text_content, encoding=self.encoding)
+
+            return ToolResult(
+                tool_name="write_file",
+                success=True,
+                data=f"Файл сохранен: {self._relative_path(path)}",
+                metadata={
+                    "path": self._relative_path(path),
+                    "bytes_written": len(text_content.encode(self.encoding)),
+                    "overwrite": overwrite
+                }
+            )
+
+        except Exception as e:
+            return ToolResult(
+                tool_name="write_file",
+                success=False,
+                data=None,
+                error=str(e)
+            )
+
+    def edit_file(self, file_path: str, old_string: str, new_string: str,
+                  replace_all: bool = False) -> ToolResult:
+        """Изменяет существующий файл, заменяя указанную строку."""
+        try:
+            if not old_string:
+                return ToolResult(
+                    tool_name="edit_file",
+                    success=False,
+                    data=None,
+                    error="Параметр old_string не может быть пустым"
+                )
+
+            path = self._resolve_path(file_path)
+            if not path.exists() or not path.is_file():
+                return ToolResult(
+                    tool_name="edit_file",
+                    success=False,
+                    data=None,
+                    error="Файл не найден"
+                )
+
+            text = path.read_text(encoding=self.encoding)
+            occurrences = text.count(old_string)
+
+            if occurrences == 0:
+                return ToolResult(
+                    tool_name="edit_file",
+                    success=False,
+                    data=None,
+                    error="Строка для замены не найдена"
+                )
+
+            if occurrences > 1 and not replace_all:
+                return ToolResult(
+                    tool_name="edit_file",
+                    success=False,
+                    data=None,
+                    error="Строка встречается несколько раз. Уточните контекст или используйте replace_all=True"
+                )
+
+            if replace_all:
+                new_text = text.replace(old_string, new_string)
+                replacements = occurrences
+            else:
+                new_text = text.replace(old_string, new_string, 1)
+                replacements = 1
+
+            path.write_text(new_text, encoding=self.encoding)
+
+            return ToolResult(
+                tool_name="edit_file",
+                success=True,
+                data=f"Заменено {replacements} фрагмент(ов) в {self._relative_path(path)}",
+                metadata={
+                    "path": self._relative_path(path),
+                    "replacements": replacements,
+                    "replace_all": replace_all
+                }
+            )
+
+        except Exception as e:
+            return ToolResult(
+                tool_name="edit_file",
+                success=False,
+                data=None,
+                error=str(e)
+            )
+
+    def ensure_directory(self, directory: str) -> Path:
+        """Гарантирует существование директории в рабочем пространстве."""
+        path = self._resolve_path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def resolve_path(self, file_path: str) -> Path:
+        """Публичная обертка для получения абсолютного пути внутри рабочей директории."""
+        return self._resolve_path(file_path)
+
+
+class MetacognitionManager:
+    """Управляет метапамятью агента через файловую систему."""
+
+    def __init__(self, fs_tools: FileSystemTools):
+        self.fs_tools = fs_tools
+        self.session_dir: Optional[str] = None
+
+    def _safe_session_name(self, query: str) -> str:
+        sanitized = re.sub(r"[^\wа-яА-ЯёЁ-]+", "_", query, flags=re.UNICODE)
+        sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+        if not sanitized:
+            sanitized = "task"
+        return sanitized[:60]
+
+    def start_session(self, query: str, context: TaskContext, plan: ExecutionPlan) -> Optional[str]:
+        """Создает файловую структуру для хранения метаданных текущей задачи."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = f"metacognition/{timestamp}_{self._safe_session_name(query)}"
+            self.fs_tools.ensure_directory(session_dir)
+            self.session_dir = session_dir
+
+            metadata = {
+                "query": query,
+                "created_at": datetime.now().isoformat(),
+                "workspace": str(self.fs_tools.base_dir.resolve()),
+                "session_directory": session_dir
+            }
+
+            context_result = self.fs_tools.write_file(
+                f"{session_dir}/context.json",
+                json.dumps(asdict(context), ensure_ascii=False, indent=2, default=str),
+                overwrite=True
+            )
+            if not context_result.success:
+                logger.warning(f"Не удалось сохранить контекст: {context_result.error}")
+
+            plan_data = {
+                "steps": plan.steps,
+                "estimated_time": plan.estimated_time,
+                "confidence": plan.confidence,
+                "fallback_plan": plan.fallback_plan,
+                "reasoning": plan.reasoning,
+                "risk_assessment": plan.risk_assessment,
+                "success_criteria": plan.success_criteria
+            }
+
+            plan_result = self.fs_tools.write_file(
+                f"{session_dir}/plan.json",
+                json.dumps(plan_data, ensure_ascii=False, indent=2, default=str),
+                overwrite=True
+            )
+            if not plan_result.success:
+                logger.warning(f"Не удалось сохранить план: {plan_result.error}")
+
+            plan_lines = [
+                "# План выполнения",
+                "",
+                f"Создан: {datetime.now().isoformat()}",
+                "",
+            ]
+            for idx, step in enumerate(plan.steps, 1):
+                description = step.get("description") or step.get("tool", "Шаг без описания")
+                priority = step.get("priority")
+                note = f" (приоритет: {priority})" if priority is not None else ""
+                plan_lines.append(f"{idx}. **{step.get('tool', 'tool')}** — {description}{note}")
+            if not plan.steps:
+                plan_lines.append("План пуст")
+
+            plan_md_result = self.fs_tools.write_file(
+                f"{session_dir}/plan.md",
+                "\n".join(plan_lines),
+                overwrite=True
+            )
+            if not plan_md_result.success:
+                logger.warning(f"Не удалось сохранить план в Markdown: {plan_md_result.error}")
+
+            metadata_result = self.fs_tools.write_file(
+                f"{session_dir}/metadata.json",
+                json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
+                overwrite=True
+            )
+            if not metadata_result.success:
+                logger.warning(f"Не удалось сохранить метаданные: {metadata_result.error}")
+
+            log_init = self.fs_tools.write_file(
+                f"{session_dir}/execution_log.jsonl",
+                "",
+                overwrite=True
+            )
+            if not log_init.success:
+                logger.warning(f"Не удалось создать файл журнала: {log_init.error}")
+
+            return session_dir
+
+        except Exception as e:
+            logger.warning(f"Не удалось инициализировать файловую сессию: {e}")
+            self.session_dir = None
+            return None
+
+    def record_system_prompt(self, prompt: str) -> None:
+        if not self.session_dir:
+            return
+        try:
+            self.fs_tools.write_file(
+                f"{self.session_dir}/system_prompt.txt",
+                prompt,
+                overwrite=True
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить системный промпт: {e}")
+
+    def update_progress(self, progress: Dict[str, Any]) -> None:
+        if not self.session_dir:
+            return
+        try:
+            self.fs_tools.write_file(
+                f"{self.session_dir}/progress.json",
+                json.dumps(progress, ensure_ascii=False, indent=2, default=str),
+                overwrite=True
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось обновить прогресс: {e}")
+
+    def log_tool_execution(self, tool_name: str, arguments: Dict[str, Any], result: ToolResult,
+                           plan_progress: Dict[str, Any], note: Optional[str] = None) -> None:
+        if not self.session_dir:
+            return
+        try:
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "tool": tool_name,
+                "arguments": arguments,
+                "success": result.success,
+                "error": result.error,
+                "data_preview": str(result.data)[:500] if result.data else None,
+                "metadata": result.metadata,
+                "confidence": result.confidence,
+                "execution_time": result.execution_time,
+                "note": note
+            }
+
+            log_path = self.fs_tools.resolve_path(f"{self.session_dir}/execution_log.jsonl")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding=self.fs_tools.encoding) as log_file:
+                log_file.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+            self.update_progress(plan_progress)
+
+        except Exception as e:
+            logger.warning(f"Не удалось записать шаг в журнал: {e}")
+
+    def finalize(self, final_answer: Optional[str], summary: Dict[str, Any]) -> None:
+        if not self.session_dir:
+            return
+        try:
+            summary_payload = summary.copy()
+            summary_payload["finalized_at"] = datetime.now().isoformat()
+            self.fs_tools.write_file(
+                f"{self.session_dir}/final_summary.json",
+                json.dumps(summary_payload, ensure_ascii=False, indent=2, default=str),
+                overwrite=True
+            )
+
+            if final_answer is not None:
+                self.fs_tools.write_file(
+                    f"{self.session_dir}/final_answer.md",
+                    final_answer,
+                    overwrite=True
+                )
+
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить финальную информацию: {e}")
+
+
 class SmartAgent:
     """Умный агент для решения задач пользователя с улучшенным анализом и планированием."""
-    
+
     def __init__(self, gigachat_client: GigaChatClient):
         self.client = gigachat_client
         self.intent_analyzer = AdvancedIntentAnalyzer(gigachat_client)
@@ -1610,7 +2065,9 @@ class SmartAgent:
         self.browser = BrowserTool()
         self.code_executor = CodeExecutor()
         self.excel_exporter = ExcelExporter()
-        
+        self.file_system = FileSystemTools()
+        self.metacognition = MetacognitionManager(self.file_system)
+
         # История выполнения
         self.execution_history = []
         
@@ -1762,7 +2219,108 @@ class SmartAgent:
                     "required": ["data"]
                 }
             })
-        
+
+        # Реальные инструменты файловой системы для метакогнитивной памяти
+        functions.extend([
+            {
+                "name": "ls",
+                "description": "Показывает содержимое рабочей директории агента",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Путь относительно рабочей директории (опционально)"
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Показывать содержимое рекурсивно",
+                            "default": False
+                        },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "description": "Включать скрытые файлы",
+                            "default": False
+                        }
+                    }
+                }
+            },
+            {
+                "name": "read_file",
+                "description": "Читает файл с номерами строк из рабочей директории",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Путь к файлу относительно рабочей директории"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "С какой строки начать чтение",
+                            "default": 0
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Сколько строк прочитать",
+                            "default": 2000
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "write_file",
+                "description": "Создает или перезаписывает файл в рабочей директории",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Путь к файлу относительно рабочей директории"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Содержимое файла"
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Перезаписать файл, если он существует",
+                            "default": False
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            },
+            {
+                "name": "edit_file",
+                "description": "Заменяет текст в существующем файле",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Путь к файлу относительно рабочей директории"
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Исходный текст для замены"
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Новый текст"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Заменить все вхождения",
+                            "default": False
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        ])
+
         functions.append({
             "name": "finish_task",
             "description": "Завершает выполнение задачи с финальным ответом",
@@ -1820,13 +2378,42 @@ class SmartAgent:
                     data = json.loads(arguments.get("data"))
                 except:
                     data = arguments.get("data")
-                
+
                 return self.excel_exporter.export_to_excel(
                     data=data,
                     filename=arguments.get("filename"),
                     sheet_name=arguments.get("sheet_name", "Данные")
                 )
-            
+
+            elif function_name == "ls":
+                return self.file_system.list_files(
+                    path=arguments.get("path"),
+                    recursive=arguments.get("recursive", False),
+                    include_hidden=arguments.get("include_hidden", False)
+                )
+
+            elif function_name == "read_file":
+                return self.file_system.read_file(
+                    file_path=arguments.get("path"),
+                    offset=arguments.get("offset", 0),
+                    limit=arguments.get("limit", 2000)
+                )
+
+            elif function_name == "write_file":
+                return self.file_system.write_file(
+                    file_path=arguments.get("path"),
+                    content=arguments.get("content", ""),
+                    overwrite=arguments.get("overwrite", False)
+                )
+
+            elif function_name == "edit_file":
+                return self.file_system.edit_file(
+                    file_path=arguments.get("path"),
+                    old_string=arguments.get("old_string", ""),
+                    new_string=arguments.get("new_string", ""),
+                    replace_all=arguments.get("replace_all", False)
+                )
+
             elif function_name == "finish_task":
                 return ToolResult(
                     tool_name="finish_task",
@@ -2060,12 +2647,19 @@ class SmartAgent:
         tools_status = f"""
 МОИ ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
 🔍 Веб-поиск: {'✅ Работает' if self.web_search.available else '❌ Недоступен'}
-📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}  
+📄 Парсинг страниц: {'✅ Работает' if self.web_parser.available else '❌ Недоступен'}
 🌐 Браузер: {'✅ Работает' if self.browser.available else '❌ Недоступен'}
 💻 Выполнение кода: ✅ Работает
-📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}"""
+📊 Excel экспорт: {'✅ Работает' if EXCEL_AVAILABLE else '❌ Недоступен'}
+🗂️ Файловая память: ✅ Работает (каталог: {self.file_system.base_dir})"""
 
         plan_reasoning = plan.reasoning if plan.reasoning else "План создан на основе базовых шаблонов"
+
+        file_system_guidelines = f"""
+МОЯ ФАЙЛОВАЯ ПАМЯТЬ:
+- Рабочая директория: {self.file_system.base_dir}
+- Всегда придерживаюсь последовательности ls → read_file перед write_file или edit_file
+- Храню заметки и журналы задач в каталоге metacognition/ для устойчивой метапамяти"""
         
         # Исправляем строку с форматированием
         plan_steps_formatted = '\n'.join([f'{i}. {step.get("description", step["tool"])} (приоритет: {step.get("priority", "не указан")})' for i, step in enumerate(plan.steps, 1)])
@@ -2083,6 +2677,8 @@ class SmartAgent:
 🕐 Временной контекст: {context.temporal_context}
 
 {tools_status}
+
+{file_system_guidelines}
 
 МОЙ ПЛАН ДЕЙСТВИЙ:
 {plan_reasoning}
@@ -2108,6 +2704,7 @@ class SmartAgent:
 - Я понимаю ограничения своих инструментов и адаптируюсь
 - Я оцениваю качество получаемых данных и ищу дополнительные источники
 - Я помню контекст всего диалога и использую накопленную информацию
+- Я использую файловую систему для фиксации анализа, планов и результатов
 
 МОЙ МОНИТОРИНГ ПРОГРЕССА:
 - Я фиксирую статус каждого шага плана и отмечаю завершенные инструменты
@@ -2140,11 +2737,19 @@ class SmartAgent:
         # Подготавливаем план к отслеживанию длительных цепочек
         self._initialize_plan_tracking(plan)
 
+        # Запускаем файловую метапамять
+        session_dir = self.metacognition.start_session(query, context, plan)
+        plan_progress_payload = self._build_plan_progress_payload(plan)
+        if session_dir:
+            self.metacognition.update_progress(plan_progress_payload)
+
         # Инициализируем диалог с улучшенным промптом
+        system_prompt = self.build_enhanced_system_prompt(context, plan)
         messages = [
-            {"role": "system", "content": self.build_enhanced_system_prompt(context, plan)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": query}
         ]
+        self.metacognition.record_system_prompt(system_prompt)
 
         execution_log = []
         final_answer = None
@@ -2217,7 +2822,15 @@ class SmartAgent:
                             'next_tool': plan_progress_payload.get('next_step', {}).get('tool') if plan_progress_payload.get('next_step') else None
                         }
                     })
-                    
+
+                    self.metacognition.log_tool_execution(
+                        tool_name=func_name,
+                        arguments=func_args,
+                        result=result,
+                        plan_progress=plan_progress_payload,
+                        note=progress_info.get('note')
+                    )
+
                     # Проверяем на завершение задачи
                     if func_name == "finish_task" and result.success:
                         final_answer = result.data
@@ -2264,6 +2877,13 @@ class SmartAgent:
                                 'next_tool': None
                             }
                         })
+                        self.metacognition.log_tool_execution(
+                            tool_name='finish_task',
+                            arguments={"answer": content},
+                            result=result,
+                            plan_progress=plan_progress_payload,
+                            note='Завершение задачи финальным ответом'
+                        )
                         plan.progress_notes.append('Задача закрыта вызовом finish_task')
                         if len(plan.progress_notes) > 10:
                             plan.progress_notes = plan.progress_notes[-10:]
@@ -2312,6 +2932,19 @@ class SmartAgent:
             quality_score += 0.3 * completion_ratio
         elif plan_adherence_percent > 50:
             quality_score += 0.3  # Следование плану
+
+        final_summary_payload = {
+            'success': final_answer is not None,
+            'final_answer_present': final_answer is not None,
+            'quality_score': quality_score,
+            'tools_used': total_tools,
+            'successful_tools': successful_tools,
+            'plan_completion_percent': plan_completion_percent,
+            'plan_adherence_percent': plan_adherence_percent,
+            'iterations_used': iterations_used,
+            'plan_progress': plan_progress_payload
+        }
+        self.metacognition.finalize(final_answer, final_summary_payload)
 
         return {
             'success': final_answer is not None,
