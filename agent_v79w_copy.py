@@ -2479,6 +2479,9 @@ class SmartAgent:
         self.file_system = FileSystemTools()
         self.metacognition = MetacognitionManager(self.file_system)
 
+        # Контроль попыток ленивого ответа без вызова инструментов
+        self.lazy_response_limit = 3
+
         # История выполнения
         self.execution_history = []
         
@@ -3036,6 +3039,53 @@ class SmartAgent:
             'recent_notes': plan.progress_notes[-5:] if plan.progress_notes else []
         }
 
+    def _has_pending_plan_steps(self, plan: ExecutionPlan) -> bool:
+        """Проверяет, остались ли невыполненные шаги плана."""
+        if not plan or not getattr(plan, 'steps', None):
+            return False
+
+        for step in plan.steps:
+            tool_name = step.get('tool')
+            if tool_name == 'finish_task':
+                continue
+            status = step.get('status')
+            if status not in ('completed', 'skipped'):
+                return True
+        return False
+
+    def _task_requires_active_tools(self, context: TaskContext) -> bool:
+        """Определяет, требует ли задача обязательного использования инструментов."""
+        return any([
+            context.requires_search,
+            context.requires_browser,
+            context.requires_computation,
+            context.requires_excel
+        ])
+
+    def _should_force_tool_usage(self, context: TaskContext, plan: ExecutionPlan) -> bool:
+        """Нужно ли настоятельно требовать вызова инструментов вместо текстового ответа."""
+        return self._task_requires_active_tools(context) and self._has_pending_plan_steps(plan)
+
+    def _build_tool_usage_reminder(self, plan: ExecutionPlan, attempt: int) -> str:
+        """Формирует напоминание модели о необходимости вызвать инструменты."""
+        pending_tools = [
+            step.get('tool', 'неизвестный инструмент')
+            for step in plan.steps
+            if step.get('status') == 'pending'
+        ] if getattr(plan, 'steps', None) else []
+
+        if not pending_tools and getattr(plan, 'steps', None):
+            pending_tools = [step.get('tool', 'неизвестный инструмент') for step in plan.steps]
+
+        tools_preview = ", ".join(pending_tools[:5]) if pending_tools else "запланированные инструменты"
+
+        reminder = (
+            f"⚠️ Попытка №{attempt}: Нельзя ограничиваться описанием шагов. "
+            f"Выполни реальные вызовы функций согласно плану ({tools_preview}) и предоставь результаты каждого инструмента. "
+            "Не завершай задачу до фактического выполнения всех необходимых инструментов и вызова finish_task только по завершении."
+        )
+        return reminder
+
     def _format_plan_steps(self, steps):
         """Форматирует шаги плана в читаемый вид."""
         formatted_steps = []
@@ -3109,6 +3159,7 @@ class SmartAgent:
 7. Для финансовых данных я использую браузер для работы с официальными сайтами{excel_info}
 8. Я ОБЯЗАТЕЛЬНО завершаю каждую задачу вызовом finish_task с исчерпывающим ответом
 9. Я отслеживаю прогресс длинных цепочек инструментов и последовательно выполняю шаги плана
+10. Мне запрещено заменять реальные вызовы инструментов описанием действий — если план не выполнен, я продолжаю использовать инструменты до завершения
 
 МОИ МЕТАКОГНИТИВНЫЕ СПОСОБНОСТИ:
 - Я анализирую свои действия и корректирую план при необходимости
@@ -3164,6 +3215,7 @@ class SmartAgent:
 
         execution_log = []
         final_answer = None
+        lazy_response_attempts = 0
 
         iteration_limit = max(max_iterations, len(plan.steps) * 2 if plan.steps else max_iterations)
         if iteration_limit != max_iterations:
@@ -3210,9 +3262,10 @@ class SmartAgent:
                         func_args = {}
                     
                     logger.info(f"Выполняется функция: {func_name} с аргументами: {func_args}")
-                    
+
                     # Выполняем функцию и обновляем прогресс плана
                     result = self.execute_function(func_name, func_args)
+                    lazy_response_attempts = 0
                     progress_info = self._update_plan_progress(plan, func_name, result)
                     plan_progress_payload = self._build_plan_progress_payload(plan)
 
@@ -3267,10 +3320,42 @@ class SmartAgent:
                 
                 else:
                     # Модель ответила без вызова функции
-                    content = message.get('content', '')
+                    content = (message.get('content') or '').strip()
+
+                    if not content:
+                        logger.debug("Получен пустой ответ без вызова функции, ожидаю дальнейших действий модели")
+                        continue
+
+                    if self._should_force_tool_usage(context, plan) and not final_answer:
+                        lazy_response_attempts += 1
+                        reminder_message = self._build_tool_usage_reminder(plan, lazy_response_attempts)
+                        logger.warning(
+                            "Модель попыталась завершить задачу без инструментов (попытка %s). Отправлено напоминание.",
+                            lazy_response_attempts
+                        )
+                        messages.append({
+                            "role": "system",
+                            "content": reminder_message
+                        })
+
+                        note_text = (
+                            f"Напоминание о необходимости вызвать инструменты (попытка {lazy_response_attempts})"
+                        )
+                        plan.progress_notes.append(note_text)
+                        if len(plan.progress_notes) > 10:
+                            plan.progress_notes = plan.progress_notes[-10:]
+
+                        if lazy_response_attempts >= self.lazy_response_limit:
+                            logger.warning(
+                                "Достигнут предел напоминаний о вызове инструментов (%s попыток)",
+                                self.lazy_response_limit
+                            )
+                        continue
+
                     if content and not final_answer:
                         # Принудительно вызываем finish_task
                         result = self.execute_function("finish_task", {"answer": content})
+                        lazy_response_attempts = 0
                         plan_progress_payload = self._build_plan_progress_payload(plan)
                         execution_log.append({
                             'function': 'finish_task',
