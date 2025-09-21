@@ -736,174 +736,128 @@ class ResponseEvaluator:
         return re.findall(r"[\wёЁ]+", (text or '').lower())
 
 class AdvancedIntentAnalyzer:
-    """Продвинутый анализатор намерений пользователя с метарассуждениями."""
-    
+    """Упрощенный анализатор намерений пользователя."""
+
     def __init__(self, gigachat_client):
+        # Клиент сохраняем для совместимости, но для анализа он не требуется
         self.client = gigachat_client
-        self.search_indicators = [
-            'найди', 'поищи', 'что такое', 'кто такой', 'где находится',
-            'когда происходит', 'как работает', 'почему', 'узнай',
-            'информация', 'данные', 'статистика', 'новости', 'последние',
-            'сегодня', 'вчера', 'на этой неделе', 'текущий', 'актуальный'
-        ]
-        
-        self.browser_indicators = [
-            'сайт', 'страница', 'url', 'ссылка', 'перейди на', 'открой',
-            'скачай', 'зарегистрируйся', 'заполни форму', 'нажми', 'интерактивно'
-        ]
-        
-        self.computation_indicators = [
-            'посчитай', 'вычисли', 'рассчитай', 'сколько', 'формула',
-            'график', 'диаграмма', 'анализ', 'сравни', 'проанализируй'
-        ]
-        
-        self.excel_indicators = [
-            'excel', 'таблица', 'экспорт', 'выгрузи', 'сохрани в',
-            'создай файл', 'отчет', 'xlsx', 'csv'
-        ]
-    
+        self.search_markers = {
+            'найди', 'поищи', 'что такое', 'кто такой', 'узнай', 'данные',
+            'информация', 'новости', 'обзор'
+        }
+        self.browser_markers = {
+            'сайт', 'страница', 'url', 'ссылка', 'перейди', 'открой', 'заполни'
+        }
+        self.computation_markers = {
+            'посчитай', 'вычисли', 'рассчитай', 'сколько', 'проанализируй',
+            'анализ', 'формула', 'график'
+        }
+        self.excel_markers = {
+            'excel', 'таблица', 'экспорт', 'выгрузи', 'xlsx', 'csv', 'отчет'
+        }
+        self.freshness_markers = {'сегодня', 'сейчас', 'актуальный', 'текущий'}
+
     def analyze_with_llm(self, query: str, original_query: Optional[str] = None) -> TaskContext:
-        """Анализирует запрос с помощью LLM для глубокого понимания намерений."""
+        """Выполняет детерминированный анализ запроса без обращения к LLM."""
+        return self._rule_based_analysis(query, original_query)
 
-        analysis_prompt = f"""Я - продвинутый аналитик задач. Мне нужно проанализировать запрос пользователя и понять его истинные намерения. Я не допускаю ленивых выводов и отмечаю потребность в инструментах, если она присутствует.
+    def _rule_based_analysis(self, query: str, original_query: Optional[str] = None) -> TaskContext:
+        normalized = query.strip()
+        lower_query = normalized.lower()
 
-ТЕКУЩАЯ ДАТА: {CURRENT_DATE_FORMATTED}
+        requires_browser = any(marker in lower_query for marker in self.browser_markers)
+        requires_excel = any(marker in lower_query for marker in self.excel_markers)
+        requires_computation = any(marker in lower_query for marker in self.computation_markers)
 
-ЗАПРОС ПОЛЬЗОВАТЕЛЯ: "{query}"
+        question_starters = {'кто', 'что', 'где', 'когда', 'почему', 'зачем', 'как', 'сколько'}
+        starts_with_question = any(lower_query.startswith(word + ' ') for word in question_starters)
+        has_question_mark = '?' in normalized
+        contains_search_marker = any(marker in lower_query for marker in self.search_markers)
 
-Я проведу глубокий анализ этого запроса:
+        requires_search = bool(
+            contains_search_marker
+            or has_question_mark
+            or starts_with_question
+        ) and not requires_browser
 
-1. ОСНОВНЫЕ НАМЕРЕНИЯ:
-   - Что пользователь действительно хочет получить?
-   - Какие скрытые потребности могут быть за этим запросом?
-   - Какова конечная цель пользователя?
-
-2. ВРЕМЕННОЙ КОНТЕКСТ:
-   - Нужна ли актуальная информация на сегодняшний день?
-   - Запрос касается прошлого, настоящего или будущего?
-   - Есть ли временные ограничения?
-
-3. НЕОБХОДИМЫЕ ИНСТРУМЕНТЫ:
-   - Нужен ли веб-поиск для получения свежей информации?
-   - Требуется ли интерактивная работа с браузером?
-   - Нужны ли вычисления или анализ данных?
-   - Следует ли экспортировать результат в Excel?
-
-4. СЛОЖНОСТЬ И ОБЛАСТЬ:
-   - Насколько сложна задача? (простая/средняя/сложная)
-   - К какой предметной области относится?
-   - Сколько этапов потребуется для решения?
-
-5. КРИТЕРИИ УСПЕХА:
-   - Как я пойму, что задача решена правильно?
-   - Какой формат ответа будет наиболее полезен?
-
-Я отвечу в формате JSON:
-{{
-    "intent": "основное намерение",
-    "user_goal": "information/action/analysis/export",
-    "requires_search": true/false,
-    "requires_browser": true/false,
-    "requires_computation": true/false,
-    "requires_excel": true/false,
-    "complexity": "simple/medium/complex",
-    "domain": "область знаний",
-    "urgency": "low/normal/high/critical",
-    "temporal_context": "historical/current/future",
-    "expected_sources": число_источников,
-    "keywords": ["ключевое слово 1", "ключевое слово 2"],
-    "success_criteria": ["критерий 1", "критерий 2"],
-    "reasoning": "подробное объяснение анализа",
-    "confidence_score": 0.0-1.0
-}}"""
-
-        try:
-            messages = [
-                {"role": "system", "content": "Ты - эксперт по анализу пользовательских намерений. Отвечай только в формате JSON."},
-                {"role": "user", "content": analysis_prompt}
-            ]
-            
-            response = self.client.chat(
-                messages=messages,
-                temperature=0.1,
-                max_tokens=2048
-            )
-            
-            if response and 'choices' in response:
-                content = response['choices'][0]['message']['content']
-                
-                # Извлекаем JSON из ответа
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    analysis_data = json.loads(json_match.group())
-                    
-                    return TaskContext(
-                        query=query,
-                        intent=analysis_data.get('intent', 'general'),
-                        user_goal=analysis_data.get('user_goal', 'information'),
-                        requires_search=analysis_data.get('requires_search', False),
-                        requires_browser=analysis_data.get('requires_browser', False),
-                        requires_computation=analysis_data.get('requires_computation', False),
-                        requires_excel=analysis_data.get('requires_excel', False),
-                        complexity=analysis_data.get('complexity', 'simple'),
-                        domain=analysis_data.get('domain', 'general'),
-                        urgency=analysis_data.get('urgency', 'normal'),
-                        temporal_context=analysis_data.get('temporal_context', 'current'),
-                        expected_sources=analysis_data.get('expected_sources', 3),
-                        keywords=analysis_data.get('keywords', []),
-                        confidence_score=analysis_data.get('confidence_score', 0.8),
-                        meta_analysis={
-                            'success_criteria': analysis_data.get('success_criteria', []),
-                            'reasoning': analysis_data.get('reasoning', ''),
-                            'llm_analysis': True
-                        },
-                        timestamp=CURRENT_DATE,
-                        original_query=original_query or query
-                    )
-
-        except Exception as e:
-            logger.warning(f"LLM анализ не удался, используем базовый: {e}")
-
-        # Fallback на базовый анализ
-        return self._basic_analysis(query, original_query)
-
-    def _basic_analysis(self, query: str, original_query: Optional[str] = None) -> TaskContext:
-        """Базовый анализ намерений (fallback)."""
-        query_lower = query.lower()
-        
-        # Определяем основные намерения
-        requires_search = any(indicator in query_lower for indicator in self.search_indicators)
-        requires_browser = any(indicator in query_lower for indicator in self.browser_indicators)
-        requires_computation = any(indicator in query_lower for indicator in self.computation_indicators)
-        requires_excel = any(indicator in query_lower for indicator in self.excel_indicators)
-        
-        # Определяем сложность
-        complexity = "simple"
-        if any(word in query_lower for word in ['анализ', 'сравни', 'исследуй']):
-            complexity = "medium"
-        if any(word in query_lower for word in ['детально', 'глубокий', 'стратегия', 'план']):
-            complexity = "complex"
-        
-        # Определяем основное намерение
-        intent = "general"
-        if requires_search:
-            intent = "search"
-        elif requires_browser:
-            intent = "web_interaction"
+        intent = 'general'
+        if requires_browser:
+            intent = 'web_interaction'
         elif requires_computation:
-            intent = "computation"
+            intent = 'computation'
         elif requires_excel:
-            intent = "excel_export"
-        
-        # Извлекаем ключевые слова
+            intent = 'excel_export'
+        elif requires_search:
+            intent = 'search'
+
+        if intent == 'general' and (contains_search_marker or has_question_mark or starts_with_question):
+            requires_search = True
+            intent = 'search'
+
+        complexity = 'simple'
+        if len(normalized) > 120 or sum([
+            requires_browser,
+            requires_computation,
+            requires_excel,
+            requires_search
+        ]) > 1:
+            complexity = 'medium'
+        if len(normalized) > 240:
+            complexity = 'complex'
+
+        temporal_context = 'current'
+        if any(marker in lower_query for marker in {'завтра', 'будет', 'план', 'будущ'}):
+            temporal_context = 'future'
+        elif any(marker in lower_query for marker in {'прошлый', 'ранее', 'история', 'ретроспектива'}):
+            temporal_context = 'historical'
+        elif any(marker in lower_query for marker in self.freshness_markers):
+            temporal_context = 'current'
+
+        user_goal = 'information'
+        if intent == 'computation':
+            user_goal = 'analysis'
+        elif intent == 'excel_export':
+            user_goal = 'export'
+        elif intent == 'web_interaction':
+            user_goal = 'action'
+
         keywords = self._extract_keywords(query)
-        
-        # Определяем домен
-        domain = self._detect_domain(query_lower, keywords)
-        
+        domain = self._detect_domain(lower_query, keywords)
+
+        reasoning_parts = []
+        if requires_browser:
+            reasoning_parts.append('Обнаружены глаголы взаимодействия с веб-сайтом.')
+        if requires_search:
+            reasoning_parts.append('Запрос похож на вопрос и требует поиска информации.')
+        if requires_computation:
+            reasoning_parts.append('Есть указания на необходимость расчетов или анализа.')
+        if requires_excel:
+            reasoning_parts.append('В тексте упомянут экспорт или таблицы.')
+        if not reasoning_parts:
+            reasoning_parts.append('Явные требования к инструментам не обнаружены, выбран общий режим.')
+
+        confidence_score = 0.9
+        if complexity == 'medium':
+            confidence_score = 0.8
+        if complexity == 'complex':
+            confidence_score = 0.7
+
+        meta_analysis = {
+            'llm_analysis': False,
+            'reasoning': ' '.join(reasoning_parts)
+        }
+
+        if requires_search:
+            expected_sources = 3
+        elif requires_browser or requires_computation:
+            expected_sources = 2
+        else:
+            expected_sources = 1
+
         return TaskContext(
             query=query,
             intent=intent,
+            user_goal=user_goal,
             requires_search=requires_search,
             requires_browser=requires_browser,
             requires_computation=requires_computation,
@@ -912,10 +866,14 @@ class AdvancedIntentAnalyzer:
             domain=domain,
             keywords=keywords,
             timestamp=CURRENT_DATE,
-            meta_analysis={'llm_analysis': False},
+            urgency='normal',
+            temporal_context=temporal_context,
+            expected_sources=expected_sources,
+            confidence_score=confidence_score,
+            meta_analysis=meta_analysis,
             original_query=original_query or query
         )
-    
+
     def _extract_keywords(self, text: str) -> List[str]:
         """Извлекает ключевые слова из текста."""
         words = re.findall(r'\b[а-яёa-z]{3,}\b', text.lower())
@@ -925,7 +883,7 @@ class AdvancedIntentAnalyzer:
         }
         keywords = [word for word in words if word not in stop_words]
         return list(set(keywords))[:10]
-    
+
     def _detect_domain(self, query: str, keywords: List[str]) -> str:
         """Определяет предметную область запроса."""
         domains = {
@@ -936,224 +894,138 @@ class AdvancedIntentAnalyzer:
             'education': ['образование', 'учеба', 'университет', 'курс'],
             'finance': ['банк', 'ставка', 'процент', 'кредит', 'цб', 'рефинансирование']
         }
-        
+
         for domain, domain_keywords in domains.items():
             if any(kw in query or kw in keywords for kw in domain_keywords):
                 return domain
-        
+
         return 'general'
 
 
 class AdvancedTaskPlanner:
-    """Продвинутый планировщик задач с метарассуждениями."""
-    
+    """Простой планировщик задач на базе детерминированных правил."""
+
     def __init__(self, gigachat_client):
         self.client = gigachat_client
-        self.base_templates = {
-            'search': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Поиск информации'},
-                {'tool': 'web_parse', 'priority': 2, 'description': 'Извлечение контента'},
-                {'tool': 'analyze_results', 'priority': 3, 'description': 'Анализ результатов'}
-            ],
-            'web_interaction': [
-                {'tool': 'browser_navigate', 'priority': 1, 'description': 'Переход на сайт'},
-                {'tool': 'wait_dynamic_content', 'priority': 2, 'description': 'Ожидание загрузки'},
-                {'tool': 'browser_extract', 'priority': 3, 'description': 'Извлечение данных'}
-            ],
-            'computation': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Поиск данных'},
-                {'tool': 'code_execute', 'priority': 2, 'description': 'Вычисления'},
-                {'tool': 'analyze_results', 'priority': 3, 'description': 'Анализ результатов'}
-            ],
-            'excel_export': [
-                {'tool': 'web_search', 'priority': 1, 'description': 'Сбор данных'},
-                {'tool': 'code_execute', 'priority': 2, 'description': 'Обработка'},
-                {'tool': 'excel_export', 'priority': 3, 'description': 'Экспорт в Excel'}
-            ]
-        }
-    
+
     def create_smart_plan(self, context: TaskContext) -> ExecutionPlan:
-        """Создает умный план выполнения с использованием LLM."""
-        
-        planning_prompt = f"""Я - опытный планировщик задач. Мне нужно создать оптимальный план выполнения для следующей задачи:
+        """Создает понятный план выполнения задачи без обращения к LLM."""
+        steps = self._build_rule_based_steps(context)
+        estimated_time = max(2.0, len(steps) * 3.0)
+        confidence = 0.85 if steps else 0.9
 
-КОНТЕКСТ ЗАДАЧИ:
-- Запрос: "{context.query}"
-- Намерение: {context.intent}
-- Цель пользователя: {context.user_goal}
-- Сложность: {context.complexity}
-- Область: {context.domain}
-- Срочность: {context.urgency}
-- Временной контекст: {context.temporal_context}
-- Ключевые слова: {', '.join(context.keywords)}
-
-ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
-1. web_search - поиск в интернете
-2. web_parse - извлечение контента со страниц
-3. browser_navigate - переход на сайт в браузере
-4. browser_extract - извлечение данных из браузера
-5. browser_click - клик по элементам
-6. wait_dynamic_content - ожидание загрузки динамического контента
-7. code_execute - выполнение Python кода
-8. excel_export - экспорт в Excel
-
-ТЕКУЩАЯ ДАТА: {CURRENT_DATE_FORMATTED}
-
-Я проанализирую задачу и создам оптимальный план:
-
-1. АНАЛИЗ ЗАДАЧИ:
-   - Какие данные нужно получить?
-   - Какие инструменты будут наиболее эффективны?
-   - В каком порядке их лучше использовать?
-   - Какие могут быть проблемы и как их избежать?
-
-2. СТРАТЕГИЯ ВЫПОЛНЕНИЯ:
-   - Начинать с самых надежных источников
-   - Использовать браузер для динамических сайтов
-   - Применять вычисления для анализа данных
-   - Экспортировать результаты если требуется
-
-3. ОЦЕНКА РИСКОВ:
-   - Что может пойти не так?
-   - Какие альтернативы подготовить?
-
-Я отвечу в формате JSON:
-{{
-    "steps": [
-        {{
-            "tool": "название_инструмента",
-            "priority": число,
-            "description": "описание шага",
-            "parameters": {{"param": "value"}},
-            "expected_outcome": "ожидаемый результат",
-            "fallback": "альтернативный инструмент"
-        }}
-    ],
-    "reasoning": "подробное объяснение логики плана",
-    "estimated_time": время_в_секундах,
-    "confidence": 0.0-1.0,
-    "risk_assessment": {{
-        "high_risk": "описание высокого риска",
-        "medium_risk": "описание среднего риска",
-        "mitigation": "стратегии снижения рисков"
-    }},
-    "success_criteria": ["критерий 1", "критерий 2"],
-    "adaptability_level": "low/medium/high"
-}}"""
-
-        try:
-            messages = [
-                {"role": "system", "content": "Ты - эксперт по планированию задач. Создавай эффективные планы в формате JSON."},
-                {"role": "user", "content": planning_prompt}
-            ]
-            
-            response = self.client.chat(
-                messages=messages,
-                temperature=0.2,
-                max_tokens=2048
-            )
-            
-            if response and 'choices' in response:
-                content = response['choices'][0]['message']['content']
-                
-                # Извлекаем JSON из ответа
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    plan_data = json.loads(json_match.group())
-                    
-                    # Адаптируем шаги под контекст
-                    adapted_steps = []
-                    for step in plan_data.get('steps', []):
-                        adapted_step = self._adapt_step_to_context(step, context)
-                        adapted_steps.append(adapted_step)
-                    
-                    return ExecutionPlan(
-                        steps=adapted_steps,
-                        reasoning=plan_data.get('reasoning', ''),
-                        estimated_time=plan_data.get('estimated_time', 30.0),
-                        confidence=plan_data.get('confidence', 0.8),
-                        risk_assessment=plan_data.get('risk_assessment', {}),
-                        success_criteria=plan_data.get('success_criteria', []),
-                        adaptability_level=plan_data.get('adaptability_level', 'medium'),
-                        fallback_plan=self._create_fallback_plan(context),
-                        current_step_index=0,
-                        completed_steps=0,
-                        progress_notes=[]
-                    )
-        
-        except Exception as e:
-            logger.warning(f"LLM планирование не удалось, используем базовое: {e}")
-        
-        # Fallback на базовое планирование
-        return self._create_basic_plan(context)
-    
-    def _adapt_step_to_context(self, step: Dict, context: TaskContext) -> Dict:
-        """Адаптирует шаг под конкретный контекст задачи."""
-        adapted = step.copy()
-        
-        # Добавляем специфичные для задачи параметры
-        if step['tool'] == 'web_search':
-            # Улучшаем поисковый запрос
-            if context.temporal_context == 'current':
-                adapted['query'] = f"{context.query} {CURRENT_DATE_STR}"
-            elif any(kw in context.keywords for kw in ['ставка', 'цб', 'банк']):
-                adapted['query'] = f"{context.query} ЦБ РФ сегодня"
-            else:
-                adapted['query'] = context.query
-            
-            adapted['keywords'] = context.keywords
-        
-        elif step['tool'] == 'browser_navigate':
-            # Если нужна актуальная информация, используем специальные сайты
-            if context.domain == 'finance' and any(kw in context.keywords for kw in ['ставка', 'цб']):
-                adapted['url'] = 'https://www.cbr.ru/'
-        
-        return adapted
-    
-    def _create_basic_plan(self, context: TaskContext) -> ExecutionPlan:
-        """Создает базовый план (fallback)."""
-        steps = []
-        
-        # Выбираем базовый шаблон
-        if context.intent in self.base_templates:
-            base_steps = self.base_templates[context.intent].copy()
-        else:
-            base_steps = self.base_templates['search'].copy()
-        
-        # Адаптируем план под контекст
-        for step in base_steps:
-            adapted_step = self._adapt_step_to_context(step, context)
-            steps.append(adapted_step)
-        
-        # Добавляем Excel экспорт если требуется
-        if context.requires_excel:
-            steps.append({
-                'tool': 'excel_export',
-                'priority': 10,
-                'description': 'Экспорт результатов в Excel'
-            })
-        
-        estimated_time = len(steps) * 5.0
+        reasoning = (
+            "План сформирован на основе набора простых правил: анализируем запрос, "
+            "подбираем инструменты и выстраиваем последовательность действий."
+        )
+        success_criteria = [
+            'Каждый шаг плана выполнен без ошибок',
+            'Пользователь получает итоговый ответ'
+        ]
+        risk_assessment = {
+            'general': 'Планирование основано на четких правилах, поэтому основные риски связаны только с неверно определенной категорией задачи.'
+        }
 
         return ExecutionPlan(
             steps=steps,
             estimated_time=estimated_time,
-            confidence=0.7,
-            reasoning="Базовый план на основе шаблонов",
+            confidence=confidence,
             fallback_plan=self._create_fallback_plan(context),
+            reasoning=reasoning,
+            risk_assessment=risk_assessment,
+            success_criteria=success_criteria,
+            adaptability_level='medium',
             current_step_index=0,
             completed_steps=0,
             progress_notes=[]
         )
-    
-    def _create_fallback_plan(self, context: TaskContext) -> List[Dict]:
-        """Создает резервный план."""
-        return [
-            {'tool': 'web_search', 'query': context.query, 'priority': 1},
-            {'tool': 'analyze_results', 'priority': 2}
-        ]
 
+    def _build_rule_based_steps(self, context: TaskContext) -> List[Dict[str, Any]]:
+        """Формирует последовательность шагов с учетом требуемых инструментов."""
+        steps: List[Dict[str, Any]] = []
+        priority = 1
 
+        def add_step(tool: str, description: str, **extra: Any) -> None:
+            nonlocal priority
+            step = {'tool': tool, 'description': description, 'priority': priority}
+            step.update(extra)
+            steps.append(step)
+            priority += 1
+
+        if context.requires_search:
+            add_step('web_search', 'Найти актуальную информацию по запросу', query=context.query)
+            add_step('web_parse', 'Структурировать и проанализировать найденные материалы')
+
+        if context.requires_browser:
+            add_step('browser_navigate', 'Открыть целевую страницу в браузере')
+            add_step('browser_extract', 'Собрать необходимые данные со страницы')
+
+        if context.requires_computation:
+            add_step('code_execute', 'Провести вычисления или анализ данных')
+
+        if context.requires_excel:
+            add_step('excel_export', 'Подготовить выгрузку или отчет в Excel')
+
+        return steps
+
+    def _create_fallback_plan(self, context: TaskContext) -> List[Dict[str, Any]]:
+        """Создает резервный план на случай сбоев основного сценария."""
+        fallback_steps: List[Dict[str, Any]] = []
+        priority = 1
+
+        if context.requires_browser:
+            fallback_steps.append({
+                'tool': 'browser_navigate',
+                'priority': priority,
+                'description': 'Открыть нужный сайт'
+            })
+            priority += 1
+            fallback_steps.append({
+                'tool': 'browser_extract',
+                'priority': priority,
+                'description': 'Получить данные со страницы'
+            })
+            priority += 1
+        else:
+            fallback_steps.append({
+                'tool': 'web_search',
+                'priority': priority,
+                'description': 'Собрать базовую информацию',
+                'query': context.query
+            })
+            priority += 1
+            fallback_steps.append({
+                'tool': 'web_parse',
+                'priority': priority,
+                'description': 'Обработать результаты поиска'
+            })
+            priority += 1
+
+        if context.requires_computation and all(step['tool'] != 'code_execute' for step in fallback_steps):
+            fallback_steps.append({
+                'tool': 'code_execute',
+                'priority': priority,
+                'description': 'Выполнить расчеты по результатам'
+            })
+            priority += 1
+
+        if context.requires_excel and all(step['tool'] != 'excel_export' for step in fallback_steps):
+            fallback_steps.append({
+                'tool': 'excel_export',
+                'priority': priority,
+                'description': 'Экспортировать итоговые данные'
+            })
+            priority += 1
+
+        if not fallback_steps:
+            fallback_steps.append({
+                'tool': 'web_search',
+                'priority': 1,
+                'description': 'Собрать исходную информацию',
+                'query': context.query
+            })
+
+        return fallback_steps
 class GigaChatClient:
     """Клиент для работы с GigaChat API."""
 
