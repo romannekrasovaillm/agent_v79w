@@ -3656,7 +3656,12 @@ class SmartAgent:
                     messages.append(function_response)
 
                     if guardrail_message:
-                        messages.append({"role": "system", "content": guardrail_message})
+                        if messages and messages[0].get("role") == "system":
+                            existing_content = messages[0].get("content", "")
+                            separator = "\n\n" if existing_content else ""
+                            messages[0]["content"] = f"{existing_content}{separator}{guardrail_message}"
+                        else:
+                            messages.insert(0, {"role": "system", "content": guardrail_message})
 
                     # Проверяем на завершение задачи
                     if func_name == "finish_task" and result.success:
